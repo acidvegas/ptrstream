@@ -89,18 +89,18 @@ async def main():
 					elif ip in result:
 						result = result.replace(ip, f'{colors.ip_match}{ip}{colors.ptr}')
 					elif (daship := ip.replace('.', '-')) in result:
-						result = result.replace(daship, f'{colors.ip_match}{daship}{colors.ptr}')
-						print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{result}{colors.reset}')
+						change = result.replace(daship, f'{colors.ip_match}{daship}{colors.ptr}')
+						print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{change}{colors.reset}')
 					elif (revip := '.'.join(ip.split('.')[::-1])) in result:
-						result = result.replace(revip, f'{colors.ip_match}{revip}{colors.ptr}')
-						print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{result}{colors.reset}')
+						change = result.replace(revip, f'{colors.ip_match}{revip}{colors.ptr}')
+						print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{change}{colors.reset}')
 					elif result.endswith('.gov') or result.endswith('.mil'):
-						result = result.replace('.gov', f'{colors.spooky}.gov{colors.reset}')
-						result = result.replace('.mil', f'{colors.spooky}.mil{colors.reset}')
+						change = result.replace('.gov', f'{colors.spooky}.gov{colors.reset}')
+						change = change.replace('.mil', f'{colors.spooky}.mil{colors.reset}')
 						print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{result}{colors.reset}')
 					elif '.gov.' in result or '.mil.' in result:
-						result = result.replace('.gov.', f'{colors.spooky}.gov.{colors.ptr}')
-						result = result.replace('.mil.', f'{colors.spooky}.mil.{colors.ptr}')
+						change = result.replace('.gov.', f'{colors.spooky}.gov.{colors.ptr}')
+						change = change.replace('.mil.', f'{colors.spooky}.mil.{colors.ptr}')
 						print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{result}{colors.reset}')
 					else:
 						print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{result}{colors.reset}')
