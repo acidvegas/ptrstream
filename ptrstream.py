@@ -13,7 +13,6 @@ try:
 except ImportError:
 	raise ImportError('missing required \'aiodns\' library (pip install aiodns)')
 
-
 # Colors
 class colors:
 	ip = '\033[35m'
@@ -24,6 +23,7 @@ class colors:
 	reset = '\033[0m'
 	separator = '\033[90m'
 
+dns_resolvers = []
 
 def get_dns_servers() -> list:
 	'''Get a list of DNS servers to use for lookups.'''
@@ -31,25 +31,21 @@ def get_dns_servers() -> list:
 	results = source.read().decode().split('\n')
 	return [server for server in results if ':' not in server]
 
-
-async def rdns(semaphore: asyncio.Semaphore, ip_address: str, custom_dns_server: str):
+async def rdns(semaphore: asyncio.Semaphore, ip_address: str, resolver: aiodns.DNSResolver):
 	'''
 	Perform a reverse DNS lookup on an IP address.
 
 	:param ip_address: The IP address to lookup.
-	:param custom_dns_server: The DNS server to use for lookups.
+	:param resolver: The DNS resolver to use for lookups.
 	:param semaphore: A semaphore to limit the number of concurrent lookups.
-	:param timeout: The timeout for the lookup.
 	'''
 	async with semaphore:
-		resolver = aiodns.DNSResolver(nameservers=[custom_dns_server], rotate=False, timeout=args.timeout)
 		reverse_name = ipaddress.ip_address(ip_address).reverse_pointer
 		try:
 			answer = await resolver.query(reverse_name, 'PTR')
 			return ip_address, answer.name
 		except:
 			return ip_address, None
-
 
 def rig(seed: int) -> str:
 	'''
@@ -64,67 +60,57 @@ def rig(seed: int) -> str:
 		ip = ipaddress.ip_address(shuffled_index)
 		yield str(ip)
 
-
 async def main():
 	'''Generate random IPs and perform reverse DNS lookups.'''
 	semaphore = asyncio.Semaphore(args.concurrency)
 	tasks = []
 	results_cache = []
 
-	if args.resolvers:
-		with open(args.resolvers) as file:
-			dns_servers = [server.strip() for server in file.readlines()]
+	global dns_resolvers
+	if not dns_resolvers:
+		dns_resolvers = [aiodns.DNSResolver(nameservers=[server], rotate=False, timeout=args.timeout) for server in get_dns_servers()[:args.concurrency]]
 
-	while True:
-		if not args.resolvers:
-			dns_servers = []
-			while not dns_servers:
-				try:
-					dns_servers = get_dns_servers()
-				except:
-					time.sleep(300)
+	seed = random.randint(10**9, 10**10 - 1)
+	ip_generator = rig(seed)
 
-		seed = random.randint(10**9, 10**10 - 1)
-		ip_generator = rig(seed)
+	for ip in ip_generator:
+		if len(tasks) < args.concurrency:
+			resolver = random.choice(dns_resolvers)
+			task = asyncio.create_task(rdns(semaphore, ip, resolver))
+			tasks.append(task)
+		else:
+			done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+			tasks = list(pending)
+			for task in done:
+				ip, result = task.result()
+				if result:
+					if result in ('127.0.0.1', 'localhost'):
+						print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}-> {result}{colors.reset}')
+					elif ip in result:
+						result = result.replace(ip, f'{colors.ip_match}{ip}{colors.ptr}')
+					elif (daship := ip.replace('.', '-')) in result:
+						result = result.replace(daship, f'{colors.ip_match}{daship}{colors.ptr}')
+						print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{result}{colors.reset}')
+					elif (revip := '.'.join(ip.split('.')[::-1])) in result:
+						result = result.replace(revip, f'{colors.ip_match}{revip}{colors.ptr}')
+						print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{result}{colors.reset}')
+					elif result.endswith('.gov') or result.endswith('.mil'):
+						result = result.replace('.gov', f'{colors.spooky}.gov{colors.reset}')
+						result = result.replace('.mil', f'{colors.spooky}.gov{colors.reset}')
+						print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{result}{colors.reset}')
+					elif '.gov.' in result or '.mil.' in result:
+						result = result.replace('.gov.', f'{colors.spooky}.gov.{colors.ptr}')
+						result = result.replace('.mil.', f'{colors.spooky}.mil.{colors.ptr}')
+						print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{result}{colors.reset}')
+					else:
+						print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{result}{colors.reset}')
 
-		for ip in ip_generator:
-			if len(tasks) < args.concurrency:
-				dns = random.choice(dns_servers)
-				task = asyncio.create_task(rdns(semaphore, ip, dns))
-				tasks.append(task)
-			else:
-				done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-				tasks = list(pending)
-				for task in done:
-					ip, result = task.result()
-					if result:
-						if result in ('127.0.0.1', 'localhost'):
-							print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}-> {result}{colors.reset}')
-						elif ip in result:
-							result = result.replace(ip, f'{colors.ip_match}{ip}{colors.ptr}')
-						elif (daship := ip.replace('.', '-')) in result:
-							result = result.replace(daship, f'{colors.ip_match}{daship}{colors.ptr}')
-							print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{result}{colors.reset}')
-						elif (revip := '.'.join(ip.split('.')[::-1])) in result:
-							result = result.replace(revip, f'{colors.ip_match}{revip}{colors.ptr}')
-							print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{result}{colors.reset}')
-						elif result.endswith('.gov') or result.endswith('.mil'):
-							result = result.replace('.gov', f'{colors.spooky}.gov{colors.reset}')
-							result = result.replace('.mil', f'{colors.spooky}.gov{colors.reset}')
-							print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{result}{colors.reset}')
-						elif '.gov.' in result or '.mil.' in result:
-							result = result.replace('.gov.', f'{colors.spooky}.gov.{colors.reset}')
-							result = result.replace('.mil.', f'{colors.spooky}.mil.{colors.reset}')
-							print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{result}{colors.reset}')
-						else:
-							print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{result}{colors.reset}')
-
-						results_cache.append(f'{ip}:{result}')
-					if len(results_cache) >= 1000:
-						stamp = time.strftime('%Y%m%d')
-						with open(f'ptr_{stamp}_{seed}.txt', 'a') as file:
-							file.writelines(f"{record}\n" for record in results_cache)
-						results_cache = []
+					results_cache.append(f'{ip}:{result}')
+				if len(results_cache) >= 1000:
+					stamp = time.strftime('%Y%m%d')
+					with open(f'ptr_{stamp}_{seed}.txt', 'a') as file:
+						file.writelines(f"{record}\n" for record in results_cache)
+					results_cache = []
 
 
 
