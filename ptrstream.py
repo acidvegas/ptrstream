@@ -60,13 +60,18 @@ async def main():
 	tasks = []
 	results_cache = []
 
+	if args.resolvers:
+		with open(args.resolvers) as file:
+			dns_servers = [server.strip() for server in file.readlines()]
+
 	while True:
-		dns_servers = []
-		while not dns_servers:
-			try:
-				dns_servers = get_dns_servers()
-			except:
-				time.sleep(300)
+		if not args.resolvers:
+			dns_servers = []
+			while not dns_servers:
+				try:
+					dns_servers = get_dns_servers()
+				except:
+					time.sleep(300)
 
 		seed = random.randint(10**9, 10**10 - 1)
 		ip_generator = rig(seed)
@@ -85,9 +90,8 @@ async def main():
 						for exclude in ('undefined.hostname.localhost', 'localhost', '127.0.0.1'):
 							if result == exclude:
 								continue
-						if not result.endswith('.in-addr.arpa') and result != ('undefined.hostname.localhost') and result != ('localhost.'):
-							print(f'{ip.ljust(15)} -> {result}')
-							results_cache.append(f'{ip}:{result}')
+						print(f'\033[96m{ip.ljust(15)}\033[0m \033[90m->\033[0m \033[93m{result}\033[0m')
+						results_cache.append(f'{ip}:{result}')
 
 					if len(results_cache) >= 1000:
 						stamp = time.strftime('%Y%m%d')
@@ -101,6 +105,7 @@ if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Perform asynchronous reverse DNS lookups.')
 	parser.add_argument('-c', '--concurrency', type=int, default=50, help='Control the speed of lookups.')
 	parser.add_argument('-t', '--timeout', type=int, default=5, help='Timeout for DNS lookups.')
+	parser.add_argument('-r', '--resolvers', type=str, help='File containing DNS servers to use for lookups.')
 	args = parser.parse_args()
 
 	asyncio.run(main())
