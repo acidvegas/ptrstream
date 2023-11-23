@@ -14,6 +14,17 @@ except ImportError:
 	raise ImportError('missing required \'aiodns\' library (pip install aiodns)')
 
 
+# Colors
+class colors:
+	ip = '\033[35m'
+	ip_match = '\033[96m'
+	ptr = '\033[93m'
+	spooky = '\033[31m'
+	invalid = '\033[90m'
+	reset = '\033[0m'
+	separator = '\033[90m'
+
+
 def get_dns_servers() -> list:
 	'''Get a list of DNS servers to use for lookups.'''
 	source = urllib.request.urlopen('https://public-dns.info/nameservers.txt')
@@ -87,27 +98,27 @@ async def main():
 				for task in done:
 					ip, result = task.result()
 					if result:
-						if result in ('127.0.0.1','localhost'):
-							print(f'\033[35m{ip.ljust(15)}\033[0m \033[90m-> {result}\033[0m')
+						if result in ('127.0.0.1', 'localhost'):
+							print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}-> {result}{colors.reset}')
 						elif ip in result:
-							result = result.replace(ip, f'\033[96m{ip}\033[93m')
+							result = result.replace(ip, f'{colors.ip_match}{ip}{colors.ptr}')
 						elif (daship := ip.replace('.', '-')) in result:
-							result = result.replace(daship, f'\033[96m{daship}\033[93m')
-							print(f'\033[35m{ip.ljust(15)}\033[0m \033[90m->\033[0m \033[93m{result}\033[0m')
+							result = result.replace(daship, f'{colors.ip_match}{daship}{colors.ptr}')
+							print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{result}{colors.reset}')
 						elif (revip := '.'.join(ip.split('.')[::-1])) in result:
-							result = result.replace(revip, f'\033[96m{revip}\033[93m')
-							print(f'\033[35m{ip.ljust(15)}\033[0m \033[90m->\033[0m \033[93m{result}\033[0m')
+							result = result.replace(revip, f'{colors.ip_match}{revip}{colors.ptr}')
+							print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{result}{colors.reset}')
 						elif result.endswith('.gov') or result.endswith('.mil'):
-							result = result.replace('.gov', f'\033[31m.gov\033[0m')
-							result = result.replace('.mil', f'\033[31m.gov\033[0m')
-							print(f'\033[35m{ip.ljust(15)}\033[0m \033[90m->\033[0m \033[93m{result}\033[0m')
+							result = result.replace('.gov', f'{colors.spooky}.gov{colors.reset}')
+							result = result.replace('.mil', f'{colors.spooky}.gov{colors.reset}')
+							print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{result}{colors.reset}')
 						elif '.gov.' in result or '.mil.' in result:
-							result = result.replace('.gov.', f'\033[31m.gov.\033[0m')
-							result = result.replace('.mil.', f'\033[31m.mil.\033[0m')
-							print(f'\033[35m{ip.ljust(15)}\033[0m \033[90m->\033[0m \033[93m{result}\033[0m')
+							result = result.replace('.gov.', f'{colors.spooky}.gov.{colors.reset}')
+							result = result.replace('.mil.', f'{colors.spooky}.mil.{colors.reset}')
+							print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{result}{colors.reset}')
 						else:
-							scary = ('.gov')
-							print(f'\033[35m{ip.ljust(15)}\033[0m \033[90m->\033[0m \033[93m{result}\033[0m')
+							print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{result}{colors.reset}')
+
 						results_cache.append(f'{ip}:{result}')
 					if len(results_cache) >= 1000:
 						stamp = time.strftime('%Y%m%d')
