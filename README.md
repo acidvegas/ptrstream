@@ -2,7 +2,7 @@
 
 PTRStream is an asynchronous reverse DNS lookup tool developed in Python. It generates random IP addresses and performs reverse DNS lookups using various DNS servers.
 
-![](.screens/preview.gif)
+
 
 ## Requirements
 - [python](https://www.python.org/)
@@ -25,4 +25,10 @@ The results are cached and saved to a file named ptr_{date}_{seed}.txt after eve
 
 Output to elastic search possibly.
 
+Extracting geo data from the ptr response...
+
 Still a work in progress I guess...
+
+
+## Preview
+![](.screens/preview.gif)
