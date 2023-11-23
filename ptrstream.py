@@ -87,12 +87,28 @@ async def main():
 				for task in done:
 					ip, result = task.result()
 					if result:
-						for exclude in ('undefined.hostname.localhost', 'localhost', '127.0.0.1'):
-							if result == exclude:
-								continue
-						print(f'\033[96m{ip.ljust(15)}\033[0m \033[90m->\033[0m \033[93m{result}\033[0m')
+						if result in ('127.0.0.1','localhost'):
+							print(f'\033[35m{ip.ljust(15)}\033[0m \033[90m-> {result}\033[0m')
+						elif ip in result:
+							result = result.replace(ip, f'\033[96m{ip}\033[93m')
+						elif (daship := ip.replace('.', '-')) in result:
+							result = result.replace(daship, f'\033[96m{daship}\033[93m')
+							print(f'\033[35m{ip.ljust(15)}\033[0m \033[90m->\033[0m \033[93m{result}\033[0m')
+						elif (revip := '.'.join(ip.split('.')[::-1])) in result:
+							result = result.replace(revip, f'\033[96m{revip}\033[93m')
+							print(f'\033[35m{ip.ljust(15)}\033[0m \033[90m->\033[0m \033[93m{result}\033[0m')
+						elif result.endswith('.gov') or result.endswith('.mil'):
+							result = result.replace('.gov', f'\033[31m.gov\033[0m')
+							result = result.replace('.mil', f'\033[31m.gov\033[0m')
+							print(f'\033[35m{ip.ljust(15)}\033[0m \033[90m->\033[0m \033[93m{result}\033[0m')
+						elif '.gov.' in result or '.mil.' in result:
+							result = result.replace('.gov.', f'\033[31m.gov.\033[0m')
+							result = result.replace('.mil.', f'\033[31m.mil.\033[0m')
+							print(f'\033[35m{ip.ljust(15)}\033[0m \033[90m->\033[0m \033[93m{result}\033[0m')
+						else:
+							scary = ('.gov')
+							print(f'\033[35m{ip.ljust(15)}\033[0m \033[90m->\033[0m \033[93m{result}\033[0m')
 						results_cache.append(f'{ip}:{result}')
-
 					if len(results_cache) >= 1000:
 						stamp = time.strftime('%Y%m%d')
 						with open(f'ptr_{stamp}_{seed}.txt', 'a') as file:
