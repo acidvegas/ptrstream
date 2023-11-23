@@ -96,7 +96,7 @@ async def main():
 						print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{result}{colors.reset}')
 					elif result.endswith('.gov') or result.endswith('.mil'):
 						result = result.replace('.gov', f'{colors.spooky}.gov{colors.reset}')
-						result = result.replace('.mil', f'{colors.spooky}.gov{colors.reset}')
+						result = result.replace('.mil', f'{colors.spooky}.mil{colors.reset}')
 						print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{result}{colors.reset}')
 					elif '.gov.' in result or '.mil.' in result:
 						result = result.replace('.gov.', f'{colors.spooky}.gov.{colors.ptr}')
