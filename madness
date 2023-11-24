@@ -1,0 +1,19 @@
+#!/bin/sh
+# maDNeSs with DNS - devloped by acidvegas (https://git.acid.vegas/ptrstream)
+
+genip() {
+    num_octets=$((RANDOM % 4 + 1))
+    ip=""
+    for i in $(seq 1 $num_octets); do
+        if [ $i -ne 1 ]; then
+            ip+="."
+        fi
+        ip+=$((RANDOM % 256))
+    done
+    echo $ip
+}
+
+while true; do
+    ip=$(genip)
+    dig +time=1 +noall +authority $ip.in-addr.arpa | grep 'IN\sSOA' | sed "s/^/\x1B[35m$ip.in-addr.arpa\x1B[90m -> \x1B[1;33m/" | sed "s/$/\x1B[0m/"
+done
