@@ -16,12 +16,12 @@ except ImportError:
 
 # Colors
 class colors:
-	ip = '\033[35m'
-	ip_match = '\033[96m'
-	ptr = '\033[93m'
-	spooky = '\033[31m'
-	invalid = '\033[90m'
-	reset = '\033[0m'
+	ip        = '\033[35m'
+	ip_match  = '\033[96m' # IP address mfound within PTR record
+	ptr       = '\033[93m'
+	spooky    = '\033[31m' # .gov or .mil indicator
+	invalid   = '\033[90m'
+	reset     = '\033[0m'
 	separator = '\033[90m'
 
 
