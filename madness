@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # maDNeSs with DNS - devloped by acidvegas (https://git.acid.vegas/ptrstream)
 
 genip() {
@@ -15,5 +15,6 @@ genip() {
 
 while true; do
     ip=$(genip)
-    dig +time=1 +noall +authority $ip.in-addr.arpa | grep 'IN\sSOA' | sed "s/^/\x1B[35m$ip.in-addr.arpa\x1B[90m -> \x1B[1;33m/" | sed "s/$/\x1B[0m/"
+    dig +time=1 +noall +authority $ip.in-addr.arpa NS
+#| grep 'IN\sSOA' | sed "s/^/\x1B[35m$ip.in-addr.arpa\x1B[90m -> \x1B[1;33m/" | sed "s/$/\x1B[0m/"
 done
