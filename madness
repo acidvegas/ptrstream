@@ -1,5 +1,6 @@
 #!/bin/bash
-# maDNeSs with DNS - devloped by acidvegas (https://git.acid.vegas/ptrstream)
+
+TIMEOUT=2
 
 genip() {
     num_octets=$((RANDOM % 4 + 1))
@@ -13,8 +14,22 @@ genip() {
     echo $ip
 }
 
+TEMP=$(mktemp -d)
 while true; do
     ip=$(genip)
-    dig +time=1 +noall +authority $ip.in-addr.arpa NS
-#| grep 'IN\sSOA' | sed "s/^/\x1B[35m$ip.in-addr.arpa\x1B[90m -> \x1B[1;33m/" | sed "s/$/\x1B[0m/"
+    ns_records=$(dig +time=$TIMEOUT +short $ip.in-addr.arpa NS)
+    for ns in $ns_records; do
+        ns_ips=$(dig +time=$TIMEOUT +short $ns A $ns AAAA)
+        for ns_ip in $ns_ips; do
+            #echo -e "AXFR on \033[36m${ns%.}\033[0m \033[90m($ns_ip)\033[0m for \033[33m$ip.in-addr.arpa\033[0m"
+            dig AXFR @$ns_ip $ip.in-addr.arpa > $TEMP/$ip.in-addr.arpa.txt
+            if [ ! -s "$zone_file" ] || grep -qE "Transfer failed|connection reset|connection refused" "$zone_file"; then
+                echo -e "\033[31m[FAIL]\033[0m AXFR on \033[36m${ns%.}\033[0m \033[90m($ns_ip)\033[0m for \033[33m$ip.in-addr.arpa\033[0m"
+                rm -f "$zone_file"
+            else
+                echo -e "\033[32m[SUCCESS]\033[0m AXFR on \033[36m${ns%.}\033[0m \033[90m($ns_ip)\033[0m for \033[33m$ip.in-addr.arpa\033[0m"
+                break
+            fi
+        done
+    done
 done
