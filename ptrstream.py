@@ -14,15 +14,18 @@ try:
 except ImportError:
 	raise ImportError('missing required \'aiodns\' library (pip install aiodns)')
 
+# Do not store these in the results file
+bad_hosts = ['localhost','undefined.hostname.localhost','unknown']
+
 # Colors
 class colors:
 	ip        = '\033[35m'
 	ip_match  = '\033[96m' # IP address mfound within PTR record
 	ptr       = '\033[93m'
-	spooky    = '\033[31m' # .gov or .mil indicator
+	red       = '\033[31m' # .gov or .mil indicator
 	invalid   = '\033[90m'
 	reset     = '\033[0m'
-	separator = '\033[90m'
+	grey      = '\033[90m'
 
 
 def get_dns_servers() -> list:
@@ -43,9 +46,19 @@ async def rdns(semaphore: asyncio.Semaphore, ip_address: str, resolver: aiodns.D
 		reverse_name = ipaddress.ip_address(ip_address).reverse_pointer
 		try:
 			answer = await resolver.query(reverse_name, 'PTR')
-			return ip_address, answer.name
-		except:
-			return ip_address, None
+			if answer.name not in bad_hosts and answer.name != ip_address and answer.name != reverse_name:
+				return ip_address, answer.name, True
+			else:
+				return ip_address, answer.name, False
+		except aiodns.error.DNSError as e:
+			if e.args[0] == aiodns.error.ARES_ENOTFOUND:
+				return ip_address, f'{colors.red}No rDNS found{colors.reset}', False
+			elif e.args[0] == aiodns.error.ARES_ETIMEOUT:
+				return ip_address, f'{colors.red}DNS query timed out{colors.reset}', False
+			else:
+				return ip_address, f'{colors.red}DNS error{colors.grey} ({e.args[1]}){colors.reset}', False
+		except Exception as e:
+			return ip_address, f'{colors.red}Unknown error{colors.grey} ({str(e)}){colors.reset}', False
 
 
 def rig(seed: int) -> str:
@@ -61,6 +74,7 @@ def rig(seed: int) -> str:
 		ip = ipaddress.ip_address(shuffled_index)
 		yield str(ip)
 
+
 def fancy_print(ip: str, result: str):
 	'''
 	Print the IP address and PTR record in a fancy way.
@@ -68,8 +82,8 @@ def fancy_print(ip: str, result: str):
 	:param ip: The IP address.
 	:param result: The PTR record.
 	'''
-	if result in ('127.0.0.1', 'localhost'):
-		print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}-> {result}{colors.reset}')
+	if result in ('127.0.0.1', 'localhost','undefined.hostname.localhost','unknown'):
+		print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.grey}-> {result}{colors.reset}')
 	else:
 		if ip in result:
 			result = result.replace(ip, f'{colors.ip_match}{ip}{colors.ptr}')
@@ -77,13 +91,9 @@ def fancy_print(ip: str, result: str):
 			result = result.replace(daship, f'{colors.ip_match}{daship}{colors.ptr}')
 		elif (revip := '.'.join(ip.split('.')[::-1])) in result:
 			result = result.replace(revip, f'{colors.ip_match}{revip}{colors.ptr}')
-		elif result.endswith('.gov') or result.endswith('.mil'):
-			result = result.replace('.gov', f'{colors.spooky}.gov{colors.reset}')
-			result = result.replace('.mil', f'{colors.spooky}.mil{colors.reset}')
-		elif '.gov.' in result or '.mil.' in result:
-			result = result.replace('.gov.', f'{colors.spooky}.gov.{colors.ptr}')
-			result = result.replace('.mil.', f'{colors.spooky}.mil.{colors.ptr}')
-	print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.separator}->{colors.reset} {colors.ptr}{result}{colors.reset}')
+		elif (revip := '.'.join(ip.split('.')[::-1]).replace('.','-')) in result:
+			result = result.replace(revip, f'{colors.ip_match}{revip}{colors.ptr}')
+	print(f'{colors.ip}{ip.ljust(15)}{colors.reset} {colors.grey}->{colors.reset} {colors.ptr}{result}{colors.reset}')
 
 
 async def main(args: argparse.Namespace):
@@ -108,7 +118,7 @@ async def main(args: argparse.Namespace):
 	tasks = []
 	results_cache = []
 
-	seed = random.randint(10**9, 10**10 - 1)
+	seed = random.randint(10**9, 10**10 - 1) if not args.seed else args.seed
 	ip_generator = rig(seed)
 
 	for ip in ip_generator:
@@ -119,10 +129,11 @@ async def main(args: argparse.Namespace):
 			done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
 			tasks = list(pending)
 			for task in done:
-				ip, result = task.result()
+				ip, result, success = task.result()
 				if result:
 					fancy_print(ip, result)
-					results_cache.append(f'{ip}:{result}')
+					if success:
+						results_cache.append(f'{ip}:{result}')
 				if len(results_cache) >= 1000:
 					stamp = time.strftime('%Y%m%d')
 					with open(f'ptr_{stamp}_{seed}.txt', 'a') as file:
@@ -133,10 +144,11 @@ async def main(args: argparse.Namespace):
 
 if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Perform asynchronous reverse DNS lookups.')
-	parser.add_argument('-c', '--concurrency', type=int, default=50, help='Control the speed of lookups.')
+	parser.add_argument('-c', '--concurrency', type=int, default=100, help='Control the speed of lookups.')
 	parser.add_argument('-t', '--timeout', type=int, default=5, help='Timeout for DNS lookups.')
 	parser.add_argument('-r', '--resolvers', type=str, help='File containing DNS servers to use for lookups.')
 	parser.add_argument('-rt', '--retries', type=int, default=3, help='Number of times to retry a DNS lookup.')
+	parser.add_argument('-s', '--seed', type=int, help='Seed to use for random number generator.')
 	args = parser.parse_args()
 
 	asyncio.run(main(args))
