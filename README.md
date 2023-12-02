@@ -1,6 +1,6 @@
 # PTR Stream
 
-PTRStream is an asynchronous reverse DNS lookup tool developed in Python. It generates random IP addresses and performs reverse DNS lookups using various DNS servers.
+The ptrstream repository contains a straightforward yet well-crafted Python script for conducting reverse DNS lookups across the entire IPv4 address range. It systematically generates each IPv4 address in a pseudo-random sequence using a seed, ensuring every possible address is covered. For each IP address, the script performs a PTR *(reverse DNS)* lookup and logs all successful findings. Designed to run continuously, ptrstream is an efficient tool for network monitoring and tracking PTR records globally, making it a practical resource for network enthusiasts and professionals who require a reliable and uncomplicated solution for DNS monitoring.
 
 ## Requirements
 - [python](https://www.python.org/)
@@ -12,21 +12,18 @@ PTRStream is an asynchronous reverse DNS lookup tool developed in Python. It gen
 python ptrstream.py [options]
 ```
 
-| Argument               | Description                                                  |
-| ---------------------- | ------------------------------------------------------------ |
-|  `-c`, `--concurrency` | Control the speed of lookups. *(Default = 50)*               |
-| `-t`, `--timeout`      | Timeout for DNS lookups.                                     |
-| `-r`, `--resolvers`    | File containing DNS servers to use for lookups. *(Optional)* |
-
-## Now what?
-The results are cached and saved to a file named ptr_{date}_{seed}.txt after every 1000 successful lookups. After a full loop through every IP address, a new seed will generate and start the scan again.
-
-Output to elastic search possibly.
-
-Extracting geo data from the ptr response...
-
-Still a work in progress I guess...
-
+| Argument              | Description                                                  |
+| --------------------- | ------------------------------------------------------------ |
+| `-c`, `--concurrency` | Control the speed of lookups. *(Default = 100)*              |
+| `-t`, `--timeout`     | Timeout for DNS lookups. *(Default = 5s)*                    |
+| `-r`, `--resolvers`   | File containing DNS servers to use for lookups. *(Optional)* |
+| `-rt`, `--retries`    | Number of times to retry a DNS lookup *(Default = 3)*        |
+| `-s`, `--seed`        | Seed to use for the random number generator.                 |
 
 ## Preview
 ![](.screens/preview.gif)
+
+___
+
+###### Mirrors
+[acid.vegas](https://git.acid.vegas/ptrstream) • [GitHub](https://github.com/acidvegas/ptrstream) • [GitLab](https://gitlab.com/acidvegas/ptrstream) • [SuperNETs](https://git.supernets.org/acidvegas/ptrstream)
