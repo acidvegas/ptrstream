@@ -452,7 +452,7 @@ func main() {
 				app.QueueUpdateDraw(func() {
 					var width int
 					_, _, width, _ = progress.GetInnerRect()
-					if width == 0 {
+					if width <= 0 {
 						return
 					}
 
@@ -465,7 +465,17 @@ func main() {
 						formatNumber(failed),
 						float64(failed)/float64(processed)*100)
 
-					barWidth := width - visibleLength(statsText) - 2
+					textWidth := visibleLength(statsText)
+					barWidth := width - textWidth - 2 // -2 for the [] characters
+
+					// Ensure barWidth is at least 1
+					if barWidth < 1 {
+						// If there's not enough space, just show the stats without the progress bar
+						progress.Clear()
+						fmt.Fprint(progress, statsText)
+						return
+					}
+
 					filled := int(float64(barWidth) * (percent / 100))
 					if filled > barWidth {
 						filled = barWidth
