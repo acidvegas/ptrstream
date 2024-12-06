@@ -1,29 +1,39 @@
 # PTR Stream
 
-The ptrstream repository contains a straightforward yet well-crafted Python script for conducting reverse DNS lookups across the entire IPv4 address range. It systematically generates each IPv4 address in a pseudo-random sequence using a seed, ensuring every possible address is covered. For each IP address, the script performs a PTR *(reverse DNS)* lookup and logs all successful findings. Designed to run continuously, ptrstream is an efficient tool for network monitoring and tracking PTR records globally, making it a practical resource for network enthusiasts and professionals who require a reliable and uncomplicated solution for DNS monitoring.
+PTR Stream is a high-performance reverse DNS *(PTR record)* lookup tool written in Go. It efficiently processes the entire IPv4 address space, performing concurrent DNS lookups with support for custom DNS servers, output logging, and real-time progress visualization.
 
-## Requirements
-- [python](https://www.python.org/)
-- [aiodns](https://pypi.org/project/aiodns/) *(pip install aiodns)*
+## Installation
+
+```bash
+go install github.com/acidvegas/ptrstream@latest
+```
+
+Or, build from source:
+
+```bash
+git clone https://github.com/acidvegas/ptrstream
+cd ptrstream
+go build
+```
 
 ## Usage
 
 ```bash
-python ptrstream.py [options]
+ptrstream [options]
 ```
 
-| Argument              | Description                                                  |
-| --------------------- | ------------------------------------------------------------ |
-| `-c`, `--concurrency` | Control the speed of lookups. *(Default = 100)*              |
-| `-t`, `--timeout`     | Timeout for DNS lookups. *(Default = 5s)*                    |
-| `-r`, `--resolvers`   | File containing DNS servers to use for lookups. *(Optional)* |
-| `-rt`, `--retries`    | Number of times to retry a DNS lookup *(Default = 3)*        |
-| `-s`, `--seed`        | Seed to use for the random number generator.                 |
+###### Command Line Arguments
+| Flag    | Description                          | Default | Example                |
+|---------|--------------------------------------|---------|------------------------|
+| `-c`    | Concurrency level                    | `100`   | `-c 200`               |
+| `-t`    | Timeout for DNS queries              | `2s`    | `-t 5s`                |
+| `-r`    | Number of retries for failed lookups | `2`     | `-r 3`                 |
+| `-dns`  | File containing DNS servers          |         | `-dns nameservers.txt` |
+| `-debug`| Show unsuccessful lookups            | `False` | `-debug`               |
+| `-o`    | Path to NDJSON output file           |         | `-o results.json`      |
+| `-s`    | Seed for IP generation               | Random  | `-s 12345`             |
+| `-shard`| Shard specification                  |         | `-shard 1/4`           | 
 
-## Preview
-![](.screens/preview.gif)
+---
 
-___
-
-###### Mirrors
-[acid.vegas](https://git.acid.vegas/ptrstream) • [GitHub](https://github.com/acidvegas/ptrstream) • [GitLab](https://gitlab.com/acidvegas/ptrstream) • [SuperNETs](https://git.supernets.org/acidvegas/ptrstream)
+###### Mirrors: [acid.vegas](https://git.acid.vegas/ptrstream) • [SuperNETs](https://git.supernets.org/acidvegas/ptrstream) • [GitHub](https://github.com/acidvegas/ptrstream) • [GitLab](https://gitlab.com/acidvegas/ptrstream) • [Codeberg](https://codeberg.org/acidvegas/ptrstream)

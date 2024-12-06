@@ -1,0 +1,22 @@
+# Binary
+ptrstream
+ptrstream.exe
+
+# Output files
+*.json
+*.txt
+
+# Go specific
+*.test
+*.out
+/vendor/
+
+# IDE specific
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS specific
+.DS_Store
+Thumbs.db 
