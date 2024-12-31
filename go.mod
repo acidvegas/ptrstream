@@ -1,4 +1,4 @@
-module ptrstream
+module github.com/acidvegas/ptrstream
 
 go 1.23.3
 
