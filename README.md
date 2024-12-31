@@ -1,5 +1,7 @@
 # PTR Stream
 
+![](./.screens/preview.gif)
+
 PTR Stream is a high-performance reverse DNS *(PTR record)* lookup tool written in Go. It efficiently processes the entire IPv4 address space, performing concurrent DNS lookups with support for custom DNS servers, output logging, and real-time progress visualization.
 
 ## Installation
