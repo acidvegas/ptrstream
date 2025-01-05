@@ -607,7 +607,7 @@ func main() {
 					}
 
 					// First line: stats
-					statsLine := fmt.Sprintf(" [aqua]Elapsed:[:-] [white]%s [gray]│[-] [aqua]Count:[:-] [white]%s [gray]│[-] [aqua]Progress:[:-] [darkgray]%7.2f%%[-] [gray]│[-] [aqua]Rate:[:-] %s [gray]│[-] [aqua]CNAMEs:[:-] [yellow]%s [-][darkgray](%5.1f%%)[-] [gray]│[-] [aqua]Successful:[:-] [green]✓%s [-][darkgray](%5.1f%%)[-] [gray]│[-] [aqua]Failed:[:-] [red]✗%s [-][darkgray](%5.1f%%)[-]\n",
+					statsLine := fmt.Sprintf(" [aqua]Elapsed:[:-] [white]%s [gray]│[-] [aqua]Count:[:-] [white]%s [gray]│[-] [aqua]Progress:[:-] [darkgray]%.2f%%[-] [gray]│[-] [aqua]Rate:[:-] %s [gray]│[-] [aqua]CNAMEs:[:-] [yellow]%s[-][darkgray] (%.1f%%)[-] [gray]│[-] [aqua]Successful:[:-] [green]✓ %s[-][darkgray] (%.1f%%)[-] [gray]│[-] [aqua]Failed:[:-] [red]✗ %s[-][darkgray] (%.1f%%)[-]\n",
 						formatDuration(time.Since(stats.startTime)),
 						formatNumber(processed),
 						percent,
@@ -693,14 +693,7 @@ func formatNumber(n uint64) string {
 		}
 		parts = append([]string{s[start:i]}, parts...)
 	}
-	formatted := strings.Join(parts, ",")
-
-	totalWidth := len(fmt.Sprint(1<<32)) + 3
-	for len(formatted) < totalWidth {
-		formatted = " " + formatted
-	}
-
-	return formatted
+	return strings.Join(parts, ",")
 }
 
 func colorizeSpeed(speed float64) string {
@@ -794,10 +787,6 @@ func formatDuration(d time.Duration) string {
 		result = fmt.Sprintf("%ds", seconds)
 	}
 
-	// Pad to exactly 14 characters
-	for len(result) < 14 {
-		result = " " + result
-	}
 	return result
 }
 
