@@ -33,6 +33,7 @@ type Config struct {
 	mu            sync.Mutex
 	lastDNSUpdate time.Time
 	updateMu      sync.Mutex
+	loop          bool
 }
 
 type Stats struct {
@@ -40,6 +41,7 @@ type Stats struct {
 	total         uint64
 	lastProcessed uint64
 	lastCheckTime time.Time
+	startTime     time.Time
 	success       uint64
 	failed        uint64
 	cnames        uint64
@@ -272,7 +274,7 @@ func colorizeIPInPtr(ptr, ip string) string {
 
 	matches := re.FindAllStringIndex(ptr, -1)
 	if matches == nil {
-		return "[green]" + ptr
+		return "[white]" + ptr
 	}
 
 	var result strings.Builder
@@ -280,7 +282,7 @@ func colorizeIPInPtr(ptr, ip string) string {
 
 	for _, match := range matches {
 		if match[0] > lastEnd {
-			result.WriteString("[green]")
+			result.WriteString("[white]")
 			result.WriteString(ptr[lastEnd:match[0]])
 		}
 		result.WriteString("[aqua]")
@@ -289,7 +291,7 @@ func colorizeIPInPtr(ptr, ip string) string {
 	}
 
 	if lastEnd < len(ptr) {
-		result.WriteString("[green]")
+		result.WriteString("[white]")
 		result.WriteString(ptr[lastEnd:])
 	}
 
@@ -395,19 +397,19 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, t
 
 		var line string
 		if len(cfg.dnsServers) > 0 {
-			line = fmt.Sprintf("[gray]%s [gray]│[-] [purple]%15s[-] [gray]│[-] [yellow]%-15s[-] [gray]│[-] %-5s [gray]│[-] [white]%-6d[-] [gray]│[-] %s\n",
+			line = fmt.Sprintf("[gray]%s [gray]│[-] [purple]%15s[-] [gray]│[-] [aqua]%-15s[-] [gray]│[-] %-5s [gray]│[-] %s [gray]│[-] %s\n",
 				timeStr,
 				ip,
 				response.Server,
 				recordTypeColor,
-				response.TTL,
+				colorizeTTL(response.TTL),
 				colorizeIPInPtr(ptr, ip))
 		} else {
-			line = fmt.Sprintf("[gray]%s [gray]│[-] [purple]%15s[-] [gray]│[-] %-5s [gray]│[-] [white]%-6d[-] [gray]│[-] %s\n",
+			line = fmt.Sprintf("[gray]%s [gray]│[-] [purple]%15s[-] [gray]│[-] %-5s [gray]│[-] %s [gray]│[-] %s\n",
 				timeStr,
 				ip,
 				recordTypeColor,
-				response.TTL,
+				colorizeTTL(response.TTL),
 				colorizeIPInPtr(ptr, ip))
 		}
 
@@ -493,6 +495,7 @@ func main() {
 	outputPath := flag.String("o", "", "Path to NDJSON output file")
 	seed := flag.Int64("s", 0, "Seed for IP generation (0 for random)")
 	shard := flag.String("shard", "", "Shard specification (e.g., 1/4 for first shard of 4)")
+	loop := flag.Bool("l", false, "Loop continuously after completion")
 	flag.Parse()
 
 	shardNum, totalShards, err := parseShardArg(*shard)
@@ -524,6 +527,7 @@ func main() {
 		debug:         *debug,
 		dnsServers:    servers,
 		lastDNSUpdate: time.Now(),
+		loop:          *loop,
 	}
 
 	if *outputPath != "" {
@@ -554,11 +558,12 @@ func main() {
 	flex := tview.NewFlex().
 		SetDirection(tview.FlexRow).
 		AddItem(textView, 0, 1, false).
-		AddItem(progress, 3, 0, false)
+		AddItem(progress, 4, 0, false)
 
 	stats := &Stats{
 		total:         1 << 32,
 		lastCheckTime: time.Now(),
+		startTime:     time.Now(),
 	}
 
 	go func() {
@@ -601,24 +606,24 @@ func main() {
 						return
 					}
 
-					statsText := fmt.Sprintf(" [aqua]Count:[:-] [white]%s [gray]│[-] [aqua]Progress:[:-] [darkgray]%7.2f%%[-] [gray]│[-] [aqua]Rate:[:-] %s [gray]│[-] [aqua]CNAMEs:[:-] [yellow]%s[-] [gray]│[-] [aqua]Successful:[:-] [green]✓%s [-][darkgray](%5.1f%%)[-] [gray]│[-] [aqua]Failed:[:-] [red]✗%s [-][darkgray](%5.1f%%)[-] ",
+					// First line: stats
+					statsLine := fmt.Sprintf(" [aqua]Elapsed:[:-] [white]%s [gray]│[-] [aqua]Count:[:-] [white]%s [gray]│[-] [aqua]Progress:[:-] [darkgray]%7.2f%%[-] [gray]│[-] [aqua]Rate:[:-] %s [gray]│[-] [aqua]CNAMEs:[:-] [yellow]%s [-][darkgray](%5.1f%%)[-] [gray]│[-] [aqua]Successful:[:-] [green]✓%s [-][darkgray](%5.1f%%)[-] [gray]│[-] [aqua]Failed:[:-] [red]✗%s [-][darkgray](%5.1f%%)[-]\n",
+						formatDuration(time.Since(stats.startTime)),
 						formatNumber(processed),
 						percent,
 						colorizeSpeed(avgSpeed),
 						formatNumber(atomic.LoadUint64(&stats.cnames)),
+						float64(atomic.LoadUint64(&stats.cnames))/float64(processed)*100,
 						formatNumber(success),
 						float64(success)/float64(processed)*100,
 						formatNumber(failed),
 						float64(failed)/float64(processed)*100)
 
-					textWidth := visibleLength(statsText)
-					barWidth := width - textWidth - 2 // -2 for the [] characters
-
-					// Ensure barWidth is at least 1
+					// Second line: progress bar
+					barWidth := width - 3 // -3 for the [] and space
 					if barWidth < 1 {
-						// If there's not enough space, just show the stats without the progress bar
 						progress.Clear()
-						fmt.Fprint(progress, statsText)
+						fmt.Fprint(progress, statsLine)
 						return
 					}
 
@@ -627,15 +632,13 @@ func main() {
 						filled = barWidth
 					}
 
-					bar := strings.Builder{}
-					bar.WriteString(statsText)
-					bar.WriteString("[")
-					bar.WriteString(strings.Repeat("█", filled))
-					bar.WriteString(strings.Repeat("░", barWidth-filled))
-					bar.WriteString("]")
+					barLine := fmt.Sprintf(" [%s%s]",
+						strings.Repeat("█", filled),
+						strings.Repeat("░", barWidth-filled))
 
+					// Combine both lines with explicit newline
 					progress.Clear()
-					fmt.Fprint(progress, bar.String())
+					fmt.Fprintf(progress, "%s%s", statsLine, barLine)
 				})
 			}
 
@@ -643,26 +646,32 @@ func main() {
 		}
 	}()
 
-	stream, err := golcg.IPStream("0.0.0.0/0", shardNum, totalShards, int(*seed), nil)
-	if err != nil {
-		fmt.Printf("Error creating IP stream: %v\n", err)
-		return
-	}
-
 	jobs := make(chan string, cfg.concurrency)
+
+	go func() {
+		for {
+			stream, err := golcg.IPStream("0.0.0.0/0", shardNum, totalShards, int(*seed), nil)
+			if err != nil {
+				fmt.Printf("Error creating IP stream: %v\n", err)
+				return
+			}
+
+			for ip := range stream {
+				jobs <- ip
+			}
+
+			if !cfg.loop {
+				break
+			}
+		}
+		close(jobs)
+	}()
 
 	var wg sync.WaitGroup
 	for i := 0; i < cfg.concurrency; i++ {
 		wg.Add(1)
 		go worker(jobs, &wg, cfg, stats, textView, app)
 	}
-
-	go func() {
-		for ip := range stream {
-			jobs <- ip
-		}
-		close(jobs)
-	}()
 
 	go func() {
 		wg.Wait()
@@ -742,5 +751,67 @@ func writeNDJSON(cfg *Config, timestamp time.Time, ip, server, ptr, recordType, 
 		cfg.outputFile.Write(data)
 		cfg.outputFile.Write([]byte("\n"))
 		cfg.mu.Unlock()
+	}
+}
+
+func formatDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+
+	days := d / (24 * time.Hour)
+	d -= days * 24 * time.Hour
+
+	hours := d / time.Hour
+	d -= hours * time.Hour
+
+	minutes := d / time.Minute
+	d -= minutes * time.Minute
+
+	seconds := d / time.Second
+
+	var result string
+
+	if days > 0 {
+		if hours > 0 && minutes > 0 {
+			result = fmt.Sprintf("%dd %dh %dm", days, hours, minutes)
+		} else if hours > 0 {
+			result = fmt.Sprintf("%dd %dh", days, hours)
+		} else {
+			result = fmt.Sprintf("%dd", days)
+		}
+	} else if hours > 0 {
+		if minutes > 0 {
+			result = fmt.Sprintf("%dh %dm", hours, minutes)
+		} else {
+			result = fmt.Sprintf("%dh", hours)
+		}
+	} else if minutes > 0 {
+		if seconds > 0 {
+			result = fmt.Sprintf("%dm %ds", minutes, seconds)
+		} else {
+			result = fmt.Sprintf("%dm", minutes)
+		}
+	} else {
+		result = fmt.Sprintf("%ds", seconds)
+	}
+
+	// Pad to exactly 14 characters
+	for len(result) < 14 {
+		result = " " + result
+	}
+	return result
+}
+
+func colorizeTTL(ttl uint32) string {
+	switch {
+	case ttl >= 86400: // 1 day or more
+		return fmt.Sprintf("[#00FF00::b]%-6d[-]", ttl) // Bright green with bold
+	case ttl >= 3600: // 1 hour or more
+		return fmt.Sprintf("[yellow]%-6d[-]", ttl)
+	case ttl >= 300: // 5 minutes or more
+		return fmt.Sprintf("[orange]%-6d[-]", ttl)
+	case ttl >= 60: // 1 minute or more
+		return fmt.Sprintf("[red]%-6d[-]", ttl)
+	default: // Less than 60 seconds
+		return fmt.Sprintf("[gray]%-6d[-]", ttl)
 	}
 }

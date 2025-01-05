@@ -27,6 +27,7 @@ go install github.com/acidvegas/ptrstream@latest
 | `-c`     | `int`    | `100`   | Concurrency level                          |
 | `-debug` | `bool`   | `false` | Show unsuccessful lookups                  |
 | `-dns`   | `string` |         | File containing DNS servers                |
+| `-l`     | `bool`   | `false` | Loop continuously after completion         |
 | `-o`     | `string` |         | Path to NDJSON output file                 |
 | `-r`     | `int`    | `2`     | Number of retries for failed lookups       |
 | `-s`     | `int`    | `0`     | Seed for IP generation *(0 for random)*    |
