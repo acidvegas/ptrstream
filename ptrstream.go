@@ -520,6 +520,7 @@ func main() {
 	seed := flag.Int64("s", 0, "Seed for IP generation (0 for random)")
 	shard := flag.String("shard", "", "Shard specification (e.g., 1/4 for first shard of 4)")
 	loop := flag.Bool("l", false, "Loop continuously after completion")
+	jsonOutput := flag.Bool("j", false, "Output NDJSON to stdout (no TUI)")
 	flag.Parse()
 
 	shardNum, totalShards, err := parseShardArg(*shard)
@@ -670,6 +671,97 @@ func main() {
 		}
 	}()
 
+	if *jsonOutput {
+		// JSON-only mode
+		jobs := make(chan string, cfg.concurrency)
+		var wg sync.WaitGroup
+
+		// Start workers
+		for i := 0; i < cfg.concurrency; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for ip := range jobs {
+					var response DNSResponse
+					var err error
+					var server string
+
+					if len(cfg.dnsServers) > 0 {
+						response, server, err = lookupWithRetry(ip, cfg)
+						if idx := strings.Index(server, ":"); idx != -1 {
+							server = server[:idx]
+						}
+					} else {
+						names, err := net.LookupAddr(ip)
+						if err == nil {
+							response = DNSResponse{Names: names, RecordType: "PTR"}
+						}
+					}
+
+					if err != nil || len(response.Names) == 0 {
+						continue
+					}
+
+					ptr := ""
+					for _, name := range response.Names {
+						if cleaned := strings.TrimSpace(strings.TrimSuffix(name, ".")); cleaned != "" {
+							ptr = cleaned
+							break
+						}
+					}
+
+					if ptr == "" {
+						continue
+					}
+
+					record := struct {
+						Seen       string `json:"seen"`
+						IP         string `json:"ip"`
+						Nameserver string `json:"nameserver"`
+						Record     string `json:"record"`
+						RecordType string `json:"record_type"`
+						TTL        uint32 `json:"ttl"`
+					}{
+						Seen:       time.Now().Format(time.RFC3339),
+						IP:         ip,
+						Nameserver: server,
+						Record:     response.Target,
+						RecordType: response.RecordType,
+						TTL:        response.TTL,
+					}
+
+					if response.RecordType != "CNAME" {
+						record.Record = ptr
+					}
+
+					if data, err := json.Marshal(record); err == nil {
+						fmt.Println(string(data))
+					}
+				}
+			}()
+		}
+
+		// Feed IPs to workers
+		for {
+			stream, err := golcg.IPStream("0.0.0.0/0", shardNum, totalShards, int(*seed), nil)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating IP stream: %v\n", err)
+				return
+			}
+
+			for ip := range stream {
+				jobs <- ip
+			}
+
+			if !cfg.loop {
+				break
+			}
+		}
+		close(jobs)
+		wg.Wait()
+		return
+	}
+
 	jobs := make(chan string, cfg.concurrency)
 
 	go func() {
@@ -746,21 +838,24 @@ func writeNDJSON(cfg *Config, timestamp time.Time, ip, server, ptr, recordType, 
 	}
 
 	record := struct {
-		Timestamp  string `json:"timestamp"`
-		IPAddr     string `json:"ip_addr"`
-		DNSServer  string `json:"dns_server"`
-		PTRRecord  string `json:"ptr_record"`
+		Seen       string `json:"seen"`
+		IP         string `json:"ip"`
+		Nameserver string `json:"nameserver"`
+		Record     string `json:"record"`
 		RecordType string `json:"record_type"`
-		Target     string `json:"target,omitempty"`
 		TTL        uint32 `json:"ttl"`
 	}{
-		Timestamp:  timestamp.Format(time.RFC3339),
-		IPAddr:     ip,
-		DNSServer:  server,
-		PTRRecord:  ptr,
+		Seen:       timestamp.Format(time.RFC3339),
+		IP:         ip,
+		Nameserver: server,
+		Record:     target, // For CNAME records, use the target
 		RecordType: recordType,
-		Target:     target,
 		TTL:        ttl,
+	}
+
+	// If it's not a CNAME, use the PTR record
+	if recordType != "CNAME" {
+		record.Record = ptr
 	}
 
 	if data, err := json.Marshal(record); err == nil {
