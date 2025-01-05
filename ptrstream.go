@@ -151,20 +151,41 @@ type DNSResponse struct {
 	TTL        uint32 // Add TTL field
 }
 
-func lookupWithRetry(ip string, cfg *Config) (DNSResponse, error) {
+func translateRcode(rcode int) string {
+	switch rcode {
+	case dns.RcodeSuccess:
+		return "Success"
+	case dns.RcodeFormatError:
+		return "Format Error"
+	case dns.RcodeServerFailure:
+		return "Server Failure"
+	case dns.RcodeNameError: // NXDOMAIN
+		return "No Such Domain"
+	case dns.RcodeNotImplemented:
+		return "Not Implemented"
+	case dns.RcodeRefused:
+		return "Query Refused"
+	default:
+		return fmt.Sprintf("DNS Error %d", rcode)
+	}
+}
+
+func lookupWithRetry(ip string, cfg *Config) (DNSResponse, string, error) {
 	var lastErr error
+	var lastServer string
 
 	for i := 0; i < cfg.retries; i++ {
 		server := cfg.getNextServer()
 		if server == "" {
-			return DNSResponse{}, fmt.Errorf("no DNS servers available")
+			return DNSResponse{}, "", fmt.Errorf("no DNS servers available")
 		}
+		lastServer = server
 
 		// Create DNS message
 		m := new(dns.Msg)
 		arpa, err := dns.ReverseAddr(ip)
 		if err != nil {
-			return DNSResponse{}, err
+			return DNSResponse{}, "", err
 		}
 		m.SetQuestion(arpa, dns.TypePTR)
 		m.RecursionDesired = true
@@ -181,13 +202,8 @@ func lookupWithRetry(ip string, cfg *Config) (DNSResponse, error) {
 		}
 
 		if r.Rcode != dns.RcodeSuccess {
-			lastErr = fmt.Errorf("DNS query failed with code: %d", r.Rcode)
+			lastErr = fmt.Errorf("%s", translateRcode(r.Rcode))
 			continue
-		}
-
-		logServer := server
-		if idx := strings.Index(server, ":"); idx != -1 {
-			logServer = server[:idx]
 		}
 
 		// Process the response
@@ -214,25 +230,25 @@ func lookupWithRetry(ip string, cfg *Config) (DNSResponse, error) {
 				if isCNAME {
 					return DNSResponse{
 						Names:      names,
-						Server:     logServer,
+						Server:     server,
 						RecordType: "CNAME",
 						Target:     strings.TrimSuffix(target, "."),
 						TTL:        ttl,
-					}, nil
+					}, server, nil
 				}
 				return DNSResponse{
 					Names:      names,
-					Server:     logServer,
+					Server:     server,
 					RecordType: "PTR",
 					TTL:        ttl,
-				}, nil
+				}, server, nil
 			}
 		}
 
 		lastErr = fmt.Errorf("no PTR records found")
 	}
 
-	return DNSResponse{}, lastErr
+	return DNSResponse{}, lastServer, lastErr
 }
 
 func reverse(ss []string) []string {
@@ -324,9 +340,13 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, t
 		timestamp := time.Now()
 		var response DNSResponse
 		var err error
+		var server string
 
 		if len(cfg.dnsServers) > 0 {
-			response, err = lookupWithRetry(ip, cfg)
+			response, server, err = lookupWithRetry(ip, cfg)
+			if idx := strings.Index(server, ":"); idx != -1 {
+				server = server[:idx]
+			}
 		} else {
 			names, err := net.LookupAddr(ip)
 			if err == nil {
@@ -339,17 +359,19 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, t
 		if err != nil {
 			stats.incrementFailed()
 			if cfg.debug {
-				timestamp := time.Now().Format("2006-01-02 15:04:05")
 				errMsg := err.Error()
 				if idx := strings.LastIndex(errMsg, ": "); idx != -1 {
 					errMsg = errMsg[idx+2:]
 				}
-				debugLine := fmt.Sprintf("[gray]%s[-] [purple]%15s[-] [gray]│[-] [red]%s[-]\n",
-					timestamp,
+				timeStr := time.Now().Format("2006-01-02 15:04:05")
+				line := fmt.Sprintf("[gray]%s [gray]│[-] [purple]%15s[-] [gray]│[-] [aqua]%-15s[-] [gray]│[-] [red] ERR [-] [gray]│[-] [gray]%-6s[-] [gray]│[-] [gray]%s[-]\n",
+					timeStr,
 					ip,
+					server,
+					"",
 					errMsg)
 				app.QueueUpdateDraw(func() {
-					fmt.Fprint(textView, debugLine)
+					fmt.Fprint(textView, line)
 					textView.ScrollToEnd()
 				})
 			}
@@ -359,12 +381,14 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, t
 		if len(response.Names) == 0 {
 			stats.incrementFailed()
 			if cfg.debug {
-				timestamp := time.Now().Format("2006-01-02 15:04:05")
-				debugLine := fmt.Sprintf("[gray]%s[-] [purple]%15s[-] [gray]│[-] [red]No PTR record[-]\n",
-					timestamp,
-					ip)
+				timeStr := time.Now().Format("2006-01-02 15:04:05")
+				line := fmt.Sprintf("[gray]%s [gray]│[-] [purple]%15s[-] [gray]│[-] [aqua]%-15s[-] [gray]│[-] [red] ERR [-] [gray]│[-] [gray]%-6s[-] [gray]│[-] [red]No PTR record[-]\n",
+					timeStr,
+					ip,
+					server,
+					"")
 				app.QueueUpdateDraw(func() {
-					fmt.Fprint(textView, debugLine)
+					fmt.Fprint(textView, line)
 					textView.ScrollToEnd()
 				})
 			}
@@ -385,7 +409,7 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, t
 			continue
 		}
 
-		writeNDJSON(cfg, timestamp, ip, response.Server, ptr, response.RecordType, response.Target, response.TTL)
+		writeNDJSON(cfg, timestamp, ip, server, ptr, response.RecordType, response.Target, response.TTL)
 
 		timeStr := time.Now().Format("2006-01-02 15:04:05")
 		recordTypeColor := "[blue] PTR [-]"
@@ -400,7 +424,7 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, t
 			line = fmt.Sprintf("[gray]%s [gray]│[-] [purple]%15s[-] [gray]│[-] [aqua]%-15s[-] [gray]│[-] %-5s [gray]│[-] %s [gray]│[-] %s\n",
 				timeStr,
 				ip,
-				response.Server,
+				server,
 				recordTypeColor,
 				colorizeTTL(response.TTL),
 				colorizeIPInPtr(ptr, ip))
