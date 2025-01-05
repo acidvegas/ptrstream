@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"regexp"
 	"strconv"
@@ -19,15 +20,19 @@ import (
 	"github.com/rivo/tview"
 )
 
+const defaultResolversURL = "https://raw.githubusercontent.com/trickest/resolvers/refs/heads/main/resolvers.txt"
+
 type Config struct {
-	concurrency int
-	timeout     time.Duration
-	retries     int
-	dnsServers  []string
-	serverIndex int
-	debug       bool
-	outputFile  *os.File
-	mu          sync.Mutex
+	concurrency   int
+	timeout       time.Duration
+	retries       int
+	dnsServers    []string
+	serverIndex   int
+	debug         bool
+	outputFile    *os.File
+	mu            sync.Mutex
+	lastDNSUpdate time.Time
+	updateMu      sync.Mutex
 }
 
 type Stats struct {
@@ -37,6 +42,7 @@ type Stats struct {
 	lastCheckTime time.Time
 	success       uint64
 	failed        uint64
+	cnames        uint64
 	speedHistory  []float64
 	mu            sync.Mutex
 }
@@ -53,7 +59,15 @@ func (s *Stats) incrementFailed() {
 	atomic.AddUint64(&s.failed, 1)
 }
 
+func (s *Stats) incrementCNAME() {
+	atomic.AddUint64(&s.cnames, 1)
+}
+
 func (c *Config) getNextServer() string {
+	if err := c.updateDNSServers(); err != nil {
+		fmt.Printf("Failed to update DNS servers: %v\n", err)
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -66,14 +80,44 @@ func (c *Config) getNextServer() string {
 	return server
 }
 
-func loadDNSServers(filename string) ([]string, error) {
-	if filename == "" {
-		return nil, nil
+func fetchDefaultResolvers() ([]string, error) {
+	resp, err := http.Get(defaultResolversURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch default resolvers: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var resolvers []string
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		resolver := strings.TrimSpace(scanner.Text())
+		if resolver != "" {
+			resolvers = append(resolvers, resolver)
+		}
 	}
 
-	file, err := os.Open(filename)
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading default resolvers: %v", err)
+	}
+
+	return resolvers, nil
+}
+
+func loadDNSServers(dnsFile string) ([]string, error) {
+	if dnsFile == "" {
+		resolvers, err := fetchDefaultResolvers()
+		if err != nil {
+			return nil, err
+		}
+		if len(resolvers) == 0 {
+			return nil, fmt.Errorf("no default resolvers found")
+		}
+		return resolvers, nil
+	}
+
+	file, err := os.Open(dnsFile)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open DNS servers file: %v", err)
 	}
 	defer file.Close()
 
@@ -81,63 +125,85 @@ func loadDNSServers(filename string) ([]string, error) {
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		server := strings.TrimSpace(scanner.Text())
-		if server != "" && !strings.HasPrefix(server, "#") {
-			if !strings.Contains(server, ":") {
-				server += ":53"
-			}
+		if server != "" {
 			servers = append(servers, server)
 		}
 	}
 
-	if len(servers) == 0 {
-		return nil, fmt.Errorf("no valid DNS servers found in file")
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading DNS servers file: %v", err)
 	}
 
-	return servers, scanner.Err()
+	if len(servers) == 0 {
+		return nil, fmt.Errorf("no DNS servers found in file")
+	}
+
+	return servers, nil
 }
 
-func lookupWithRetry(ip string, cfg *Config) ([]string, string, error) {
-	server := cfg.getNextServer()
-	if server == "" {
-		return nil, "", fmt.Errorf("no DNS servers available")
-	}
+type DNSResponse struct {
+	Names      []string
+	Server     string
+	RecordType string // "PTR" or "CNAME"
+	Target     string // For CNAME records, stores the target
+}
 
-	r := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{
-				Timeout: cfg.timeout,
-			}
-			return d.DialContext(ctx, "udp", server)
-		},
-	}
+func lookupWithRetry(ip string, cfg *Config) (DNSResponse, error) {
+	var lastErr error
 
 	for i := 0; i < cfg.retries; i++ {
+		server := cfg.getNextServer()
+		if server == "" {
+			return DNSResponse{}, fmt.Errorf("no DNS servers available")
+		}
+
+		r := &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				d := net.Dialer{
+					Timeout: cfg.timeout,
+				}
+				return d.DialContext(ctx, "udp", server)
+			},
+		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
 		names, err := r.LookupAddr(ctx, ip)
 		cancel()
 
 		if err == nil {
-			return names, server, nil
+			logServer := server
+			if idx := strings.Index(server, ":"); idx != -1 {
+				logServer = server[:idx]
+			}
+
+			// Check if any of the names is a CNAME
+			for _, name := range names {
+				ctx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
+				cname, err := r.LookupCNAME(ctx, strings.TrimSuffix(name, "."))
+				cancel()
+
+				if err == nil && cname != name {
+					return DNSResponse{
+						Names:      names,
+						Server:     logServer,
+						RecordType: "CNAME",
+						Target:     strings.TrimSuffix(cname, "."),
+					}, nil
+				}
+			}
+
+			return DNSResponse{
+				Names:      names,
+				Server:     logServer,
+				RecordType: "PTR",
+			}, nil
 		}
 
-		if i < cfg.retries-1 {
-			server = cfg.getNextServer()
-			if server == "" {
-				return nil, "", fmt.Errorf("no more DNS servers available")
-			}
-			r = &net.Resolver{
-				PreferGo: true,
-				Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-					d := net.Dialer{
-						Timeout: cfg.timeout,
-					}
-					return d.DialContext(ctx, "udp", server)
-				},
-			}
-		}
+		lastErr = err
 	}
-	return nil, "", fmt.Errorf("lookup failed after %d retries", cfg.retries)
+
+	return DNSResponse{}, lastErr
 }
 
 func reverse(ss []string) []string {
@@ -201,9 +267,16 @@ func colorizeIPInPtr(ptr, ip string) string {
 	}
 
 	finalResult := result.String()
-	finalResult = strings.ReplaceAll(finalResult, ".in-addr.arpa", ".[blue]in-addr.arpa")
-	finalResult = strings.ReplaceAll(finalResult, ".gov", ".[red]gov")
-	finalResult = strings.ReplaceAll(finalResult, ".mil", ".[red]mil")
+
+	if strings.HasSuffix(finalResult, ".in-addr.arpa") {
+		finalResult = finalResult[:len(finalResult)-13] + ".[blue]in-addr.arpa"
+	}
+	if strings.HasSuffix(finalResult, ".gov") {
+		finalResult = finalResult[:len(finalResult)-4] + ".[red]gov"
+	}
+	if strings.HasSuffix(finalResult, ".mil") {
+		finalResult = finalResult[:len(finalResult)-4] + ".[red]mil"
+	}
 
 	return finalResult
 }
@@ -219,18 +292,17 @@ const maxBufferLines = 1000
 func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, textView *tview.TextView, app *tview.Application) {
 	defer wg.Done()
 	for ip := range jobs {
-		var names []string
-		var server string
-		var err error
 		timestamp := time.Now()
+		var response DNSResponse
+		var err error
 
 		if len(cfg.dnsServers) > 0 {
-			names, server, err = lookupWithRetry(ip, cfg)
-			if idx := strings.Index(server, ":"); idx != -1 {
-				server = server[:idx]
-			}
+			response, err = lookupWithRetry(ip, cfg)
 		} else {
-			names, err = net.LookupAddr(ip)
+			names, err := net.LookupAddr(ip)
+			if err == nil {
+				response = DNSResponse{Names: names, RecordType: "PTR"}
+			}
 		}
 
 		stats.increment()
@@ -255,7 +327,7 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, t
 			continue
 		}
 
-		if len(names) == 0 {
+		if len(response.Names) == 0 {
 			stats.incrementFailed()
 			if cfg.debug {
 				timestamp := time.Now().Format("2006-01-02 15:04:05")
@@ -273,7 +345,7 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, t
 		stats.incrementSuccess()
 
 		ptr := ""
-		for _, name := range names {
+		for _, name := range response.Names {
 			if cleaned := strings.TrimSpace(strings.TrimSuffix(name, ".")); cleaned != "" {
 				ptr = cleaned
 				break
@@ -284,21 +356,29 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, t
 			continue
 		}
 
-		writeNDJSON(cfg, timestamp, ip, server, ptr)
+		writeNDJSON(cfg, timestamp, ip, response.Server, ptr, response.RecordType, response.Target)
 
 		timeStr := time.Now().Format("2006-01-02 15:04:05")
+		recordTypeColor := "[blue] PTR [-]"
+		if response.RecordType == "CNAME" {
+			stats.incrementCNAME()
+			recordTypeColor = "[fuchsia]CNAME[-]"
+			ptr = fmt.Sprintf("%s -> %s", ptr, response.Target)
+		}
 
 		var line string
 		if len(cfg.dnsServers) > 0 {
-			line = fmt.Sprintf("[gray]%s[-] [purple]%15s[-] [gray]│[-] [yellow]%15s[-] [gray]│[-] %s\n",
+			line = fmt.Sprintf("[gray]%s [gray]│[-] [purple]%15s[-] [gray]│[-] [yellow]%-15s[-] [gray]│[-] %-5s [gray]│[-] %s\n",
 				timeStr,
 				ip,
-				server,
+				response.Server,
+				recordTypeColor,
 				colorizeIPInPtr(ptr, ip))
 		} else {
-			line = fmt.Sprintf("[gray]%s[-] [purple]%15s[-] [gray]│[-] %s\n",
+			line = fmt.Sprintf("[gray]%s [gray]│[-] [purple]%15s[-] [gray]│[-] %-5s [gray]│[-] %s\n",
 				timeStr,
 				ip,
+				recordTypeColor,
 				colorizeIPInPtr(ptr, ip))
 		}
 
@@ -343,6 +423,38 @@ func parseShardArg(shard string) (int, int, error) {
 	return shardNum, totalShards, nil
 }
 
+func (c *Config) updateDNSServers() error {
+	c.updateMu.Lock()
+	defer c.updateMu.Unlock()
+
+	if time.Since(c.lastDNSUpdate) < 24*time.Hour {
+		return nil
+	}
+
+	resolvers, err := fetchDefaultResolvers()
+	if err != nil {
+		return err
+	}
+
+	if len(resolvers) == 0 {
+		return fmt.Errorf("no resolvers found in update")
+	}
+
+	for i, server := range resolvers {
+		if !strings.Contains(server, ":") {
+			resolvers[i] = server + ":53"
+		}
+	}
+
+	c.mu.Lock()
+	c.dnsServers = resolvers
+	c.serverIndex = 0
+	c.lastDNSUpdate = time.Now()
+	c.mu.Unlock()
+
+	return nil
+}
+
 func main() {
 	concurrency := flag.Int("c", 100, "Concurrency level")
 	timeout := flag.Duration("t", 2*time.Second, "Timeout for DNS queries")
@@ -364,11 +476,25 @@ func main() {
 		*seed = time.Now().UnixNano()
 	}
 
+	servers, err := loadDNSServers(*dnsFile)
+	if err != nil {
+		fmt.Printf("Error loading DNS servers: %v\n", err)
+		return
+	}
+
+	for i, server := range servers {
+		if !strings.Contains(server, ":") {
+			servers[i] = server + ":53"
+		}
+	}
+
 	cfg := &Config{
-		concurrency: *concurrency,
-		timeout:     *timeout,
-		retries:     *retries,
-		debug:       *debug,
+		concurrency:   *concurrency,
+		timeout:       *timeout,
+		retries:       *retries,
+		debug:         *debug,
+		dnsServers:    servers,
+		lastDNSUpdate: time.Now(),
 	}
 
 	if *outputPath != "" {
@@ -379,16 +505,6 @@ func main() {
 		}
 		cfg.outputFile = f
 		defer f.Close()
-	}
-
-	if *dnsFile != "" {
-		servers, err := loadDNSServers(*dnsFile)
-		if err != nil {
-			fmt.Printf("Error loading DNS servers: %v\n", err)
-			return
-		}
-		cfg.dnsServers = servers
-		fmt.Printf("Loaded %d DNS servers\n", len(servers))
 	}
 
 	app := tview.NewApplication()
@@ -456,10 +572,11 @@ func main() {
 						return
 					}
 
-					statsText := fmt.Sprintf(" [aqua]Count:[:-] [white]%s [gray]│[-] [aqua]Progress:[:-] [darkgray]%7.2f%%[-] [gray]│[-] [aqua]Rate:[:-] %s [gray]│[-] [aqua]Successful:[:-] [green]✓%s [-][darkgray](%5.1f%%)[-] [gray]│[-] [aqua]Failed:[:-] [red]✗%s [-][darkgray](%5.1f%%)[-] ",
+					statsText := fmt.Sprintf(" [aqua]Count:[:-] [white]%s [gray]│[-] [aqua]Progress:[:-] [darkgray]%7.2f%%[-] [gray]│[-] [aqua]Rate:[:-] %s [gray]│[-] [aqua]CNAMEs:[:-] [yellow]%s[-] [gray]│[-] [aqua]Successful:[:-] [green]✓%s [-][darkgray](%5.1f%%)[-] [gray]│[-] [aqua]Failed:[:-] [red]✗%s [-][darkgray](%5.1f%%)[-] ",
 						formatNumber(processed),
 						percent,
 						colorizeSpeed(avgSpeed),
+						formatNumber(atomic.LoadUint64(&stats.cnames)),
 						formatNumber(success),
 						float64(success)/float64(processed)*100,
 						formatNumber(failed),
@@ -568,21 +685,25 @@ func visibleLength(s string) int {
 	return len(noColors)
 }
 
-func writeNDJSON(cfg *Config, timestamp time.Time, ip, server, ptr string) {
+func writeNDJSON(cfg *Config, timestamp time.Time, ip, server, ptr, recordType, target string) {
 	if cfg.outputFile == nil {
 		return
 	}
 
 	record := struct {
-		Timestamp string `json:"timestamp"`
-		IPAddr    string `json:"ip_addr"`
-		DNSServer string `json:"dns_server"`
-		PTRRecord string `json:"ptr_record"`
+		Timestamp  string `json:"timestamp"`
+		IPAddr     string `json:"ip_addr"`
+		DNSServer  string `json:"dns_server"`
+		PTRRecord  string `json:"ptr_record"`
+		RecordType string `json:"record_type"`
+		Target     string `json:"target,omitempty"`
 	}{
-		Timestamp: timestamp.Format(time.RFC3339),
-		IPAddr:    ip,
-		DNSServer: server,
-		PTRRecord: ptr,
+		Timestamp:  timestamp.Format(time.RFC3339),
+		IPAddr:     ip,
+		DNSServer:  server,
+		PTRRecord:  ptr,
+		RecordType: recordType,
+		Target:     target,
 	}
 
 	if data, err := json.Marshal(record); err == nil {
