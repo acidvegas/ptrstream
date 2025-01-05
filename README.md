@@ -1,7 +1,9 @@
 # PTRStream
 > High-performance distributed PTR record scanner with real-time streaming output
 
-PTRStream is a fast and efficient PTR record scanner designed for distributed scanning operations. It uses a Linear Congruential Generator (LCG) for deterministic IP generation, allowing for easy distribution of work across multiple machines while maintaining pseudo-random ordering.
+![](./.screens/preview.gif)
+
+PTRStream is a fast and efficient PTR record scanner designed for distributed scanning operations. It uses a Linear Congruential Generator *(LCG)* for deterministic IP generation, allowing for easy distribution of work across multiple machines while maintaining pseudo-random ordering.
 
 ## Features
 
@@ -75,14 +77,14 @@ ptrstream -shard 4/4 -s 12345  # Machine 4
 
 ## Real-time Data Pipeline Integration
 
-PTRStream outputs NDJSON (Newline Delimited JSON) format, making it perfect for real-time data pipeline integration. Each line contains a complete JSON record with:
+PTRStream outputs NDJSON *(Newline Delimited JSON)* format, making it perfect for real-time data pipeline integration. Each line contains a complete JSON record with:
 
 - Timestamp
 - IP Address
 - DNS Server used
-- Record Type (PTR/CNAME)
+- Record Type *(PTR/CNAME)*
 - PTR Record
-- CNAME Target (if applicable)
+- CNAME Target *(if applicable)*
 - TTL Value
 
 Example using named pipe to Elasticsearch:
