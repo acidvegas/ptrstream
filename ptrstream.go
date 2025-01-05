@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -17,6 +16,7 @@ import (
 	"time"
 
 	"github.com/acidvegas/golcg"
+	"github.com/miekg/dns"
 	"github.com/rivo/tview"
 )
 
@@ -146,6 +146,7 @@ type DNSResponse struct {
 	Server     string
 	RecordType string // "PTR" or "CNAME"
 	Target     string // For CNAME records, stores the target
+	TTL        uint32 // Add TTL field
 }
 
 func lookupWithRetry(ip string, cfg *Config) (DNSResponse, error) {
@@ -157,50 +158,76 @@ func lookupWithRetry(ip string, cfg *Config) (DNSResponse, error) {
 			return DNSResponse{}, fmt.Errorf("no DNS servers available")
 		}
 
-		r := &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				d := net.Dialer{
-					Timeout: cfg.timeout,
-				}
-				return d.DialContext(ctx, "udp", server)
-			},
+		// Create DNS message
+		m := new(dns.Msg)
+		arpa, err := dns.ReverseAddr(ip)
+		if err != nil {
+			return DNSResponse{}, err
+		}
+		m.SetQuestion(arpa, dns.TypePTR)
+		m.RecursionDesired = true
+
+		// Create DNS client
+		c := new(dns.Client)
+		c.Timeout = cfg.timeout
+
+		// Make the query
+		r, _, err := c.Exchange(m, server)
+		if err != nil {
+			lastErr = err
+			continue
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
-		names, err := r.LookupAddr(ctx, ip)
-		cancel()
+		if r.Rcode != dns.RcodeSuccess {
+			lastErr = fmt.Errorf("DNS query failed with code: %d", r.Rcode)
+			continue
+		}
 
-		if err == nil {
-			logServer := server
-			if idx := strings.Index(server, ":"); idx != -1 {
-				logServer = server[:idx]
+		logServer := server
+		if idx := strings.Index(server, ":"); idx != -1 {
+			logServer = server[:idx]
+		}
+
+		// Process the response
+		if len(r.Answer) > 0 {
+			var names []string
+			var ttl uint32
+			var isCNAME bool
+			var target string
+
+			for _, ans := range r.Answer {
+				switch rr := ans.(type) {
+				case *dns.PTR:
+					names = append(names, rr.Ptr)
+					ttl = rr.Hdr.Ttl
+				case *dns.CNAME:
+					isCNAME = true
+					names = append(names, rr.Hdr.Name)
+					target = rr.Target
+					ttl = rr.Hdr.Ttl
+				}
 			}
 
-			// Check if any of the names is a CNAME
-			for _, name := range names {
-				ctx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
-				cname, err := r.LookupCNAME(ctx, strings.TrimSuffix(name, "."))
-				cancel()
-
-				if err == nil && cname != name {
+			if len(names) > 0 {
+				if isCNAME {
 					return DNSResponse{
 						Names:      names,
 						Server:     logServer,
 						RecordType: "CNAME",
-						Target:     strings.TrimSuffix(cname, "."),
+						Target:     strings.TrimSuffix(target, "."),
+						TTL:        ttl,
 					}, nil
 				}
+				return DNSResponse{
+					Names:      names,
+					Server:     logServer,
+					RecordType: "PTR",
+					TTL:        ttl,
+				}, nil
 			}
-
-			return DNSResponse{
-				Names:      names,
-				Server:     logServer,
-				RecordType: "PTR",
-			}, nil
 		}
 
-		lastErr = err
+		lastErr = fmt.Errorf("no PTR records found")
 	}
 
 	return DNSResponse{}, lastErr
@@ -356,7 +383,7 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, t
 			continue
 		}
 
-		writeNDJSON(cfg, timestamp, ip, response.Server, ptr, response.RecordType, response.Target)
+		writeNDJSON(cfg, timestamp, ip, response.Server, ptr, response.RecordType, response.Target, response.TTL)
 
 		timeStr := time.Now().Format("2006-01-02 15:04:05")
 		recordTypeColor := "[blue] PTR [-]"
@@ -368,17 +395,19 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, t
 
 		var line string
 		if len(cfg.dnsServers) > 0 {
-			line = fmt.Sprintf("[gray]%s [gray]│[-] [purple]%15s[-] [gray]│[-] [yellow]%-15s[-] [gray]│[-] %-5s [gray]│[-] %s\n",
+			line = fmt.Sprintf("[gray]%s [gray]│[-] [purple]%15s[-] [gray]│[-] [yellow]%-15s[-] [gray]│[-] %-5s [gray]│[-] [white]%-6d[-] [gray]│[-] %s\n",
 				timeStr,
 				ip,
 				response.Server,
 				recordTypeColor,
+				response.TTL,
 				colorizeIPInPtr(ptr, ip))
 		} else {
-			line = fmt.Sprintf("[gray]%s [gray]│[-] [purple]%15s[-] [gray]│[-] %-5s [gray]│[-] %s\n",
+			line = fmt.Sprintf("[gray]%s [gray]│[-] [purple]%15s[-] [gray]│[-] %-5s [gray]│[-] [white]%-6d[-] [gray]│[-] %s\n",
 				timeStr,
 				ip,
 				recordTypeColor,
+				response.TTL,
 				colorizeIPInPtr(ptr, ip))
 		}
 
@@ -685,7 +714,7 @@ func visibleLength(s string) int {
 	return len(noColors)
 }
 
-func writeNDJSON(cfg *Config, timestamp time.Time, ip, server, ptr, recordType, target string) {
+func writeNDJSON(cfg *Config, timestamp time.Time, ip, server, ptr, recordType, target string, ttl uint32) {
 	if cfg.outputFile == nil {
 		return
 	}
@@ -697,6 +726,7 @@ func writeNDJSON(cfg *Config, timestamp time.Time, ip, server, ptr, recordType, 
 		PTRRecord  string `json:"ptr_record"`
 		RecordType string `json:"record_type"`
 		Target     string `json:"target,omitempty"`
+		TTL        uint32 `json:"ttl"`
 	}{
 		Timestamp:  timestamp.Format(time.RFC3339),
 		IPAddr:     ip,
@@ -704,6 +734,7 @@ func writeNDJSON(cfg *Config, timestamp time.Time, ip, server, ptr, recordType, 
 		PTRRecord:  ptr,
 		RecordType: recordType,
 		Target:     target,
+		TTL:        ttl,
 	}
 
 	if data, err := json.Marshal(record); err == nil {
