@@ -47,6 +47,7 @@ type Stats struct {
 	cnames        uint64
 	speedHistory  []float64
 	mu            sync.Mutex
+	round         uint64
 }
 
 func (s *Stats) increment() {
@@ -632,8 +633,9 @@ func main() {
 					}
 
 					// First line: stats
-					statsLine := fmt.Sprintf(" [aqua]Elapsed:[:-] [white]%s [gray]│[-] [aqua]Count:[:-] [white]%s [gray]│[-] [aqua]Progress:[:-] [darkgray]%.2f%%[-] [gray]│[-] [aqua]Rate:[:-] %s [gray]│[-] [aqua]CNAMEs:[:-] [yellow]%s[-][darkgray] (%.1f%%)[-] [gray]│[-] [aqua]Successful:[:-] [green]✓ %s[-][darkgray] (%.1f%%)[-] [gray]│[-] [aqua]Failed:[:-] [red]✗ %s[-][darkgray] (%.1f%%)[-]\n",
+					statsLine := fmt.Sprintf(" [aqua]Elapsed:[:-] [white]%s [gray]│[-] [aqua]Round:[:-] [white]%d [gray]│[-] [aqua]Count:[:-] [white]%s [gray]│[-] [aqua]Progress:[:-] [darkgray]%.2f%%[-] [gray]│[-] [aqua]Rate:[:-] %s [gray]│[-] [aqua]CNAMEs:[:-] [yellow]%s[-][darkgray] (%.1f%%)[-] [gray]│[-] [aqua]Successful:[:-] [green]✓ %s[-][darkgray] (%.1f%%)[-] [gray]│[-] [aqua]Failed:[:-] [red]✗ %s[-][darkgray] (%.1f%%)[-]\n",
 						formatDuration(time.Since(stats.startTime)),
+						atomic.LoadUint64(&stats.round)+1,
 						formatNumber(processed),
 						percent,
 						colorizeSpeed(avgSpeed),
