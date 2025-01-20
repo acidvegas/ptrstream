@@ -14,6 +14,7 @@ PTRStream is a fast and efficient PTR record scanner designed for distributed sc
 - Automatic DNS server rotation from public resolvers
 - Progress tracking with detailed statistics
 - Colorized terminal output
+- CAIDA-style error formatting (with -debug flag)
 
 ## Installation
 
@@ -27,13 +28,13 @@ go install github.com/acidvegas/ptrstream@latest
 | `-c`     | `int`    | `100`   | Concurrency level                          |
 | `-debug` | `bool`   | `false` | Show unsuccessful lookups                  |
 | `-dns`   | `string` |         | File containing DNS servers                |
+| `-j`     | `bool`   | `false` | Output NDJSON to stdout (no TUI)          |
 | `-l`     | `bool`   | `false` | Loop continuously after completion         |
 | `-o`     | `string` |         | Path to NDJSON output file                 |
 | `-r`     | `int`    | `2`     | Number of retries for failed lookups       |
 | `-s`     | `int`    | `0`     | Seed for IP generation *(0 for random)*    |
 | `-shard` | `string` |         | Shard specification *(index/total format)* |
 | `-t`     | `int`    | `2`     | Timeout for DNS queries                    |
-
 
 ## Usage
 
@@ -114,6 +115,30 @@ Example NDJSON output:
 {"timestamp":"2024-01-05T12:34:56Z","ip_addr":"1.2.3.4","dns_server":"8.8.8.8","ptr_record":"example.com","record_type":"PTR","ttl":3600}
 {"timestamp":"2024-01-05T12:34:57Z","ip_addr":"5.6.7.8","dns_server":"1.1.1.1","ptr_record":"original.com","record_type":"CNAME","target":"target.com","ttl":600}
 ```
----
+
+## Debug Mode
+
+When running with `-debug`, failed lookups are displayed and logged using CAIDA-style error formatting. Each error is represented as a special `.in-addr.arpa` address:
+
+```
+2024-01-05 12:34:56 │ 1.2.3.4     │ 8.8.8.8        │  ERR  │        │ FAIL.TIMEOUT.in-addr.arpa
+2024-01-05 12:34:57 │ 5.6.7.8     │ 1.1.1.1        │  ERR  │        │ FAIL.SERVER-FAILURE.in-addr.arpa
+2024-01-05 12:34:58 │ 9.10.11.12  │ 8.8.4.4        │  ERR  │        │ FAIL.NON-AUTHORITATIVE.in-addr.arpa
+```
+
+Error types include:
+- `FAIL.TIMEOUT.in-addr.arpa` - DNS query timed out
+- `FAIL.SERVER-FAILURE.in-addr.arpa` - DNS server returned an error
+- `FAIL.NON-AUTHORITATIVE.in-addr.arpa` - No authoritative answer
+- `FAIL.REFUSED.in-addr.arpa` - Query was refused
+- `FAIL.NO-PTR-RECORD.in-addr.arpa` - No PTR record exists
+- And more...
+
+These errors are also included in the NDJSON output when using `-debug` with either `-o` or `-j`:
+```json
+{"seen":"2024-01-05T12:34:56Z","ip":"1.2.3.4","nameserver":"8.8.8.8","record":"FAIL.TIMEOUT.in-addr.arpa","record_type":"ERR","ttl":0}
+```
+
+___
 
 ###### Mirrors: [acid.vegas](https://git.acid.vegas/ptrstream) • [SuperNETs](https://git.supernets.org/acidvegas/ptrstream) • [GitHub](https://github.com/acidvegas/ptrstream) • [GitLab](https://gitlab.com/acidvegas/ptrstream) • [Codeberg](https://codeberg.org/acidvegas/ptrstream)
