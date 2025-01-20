@@ -359,21 +359,21 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, t
 		if err != nil {
 			stats.incrementFailed()
 			if cfg.debug {
-				errMsg := err.Error()
-				if idx := strings.LastIndex(errMsg, ": "); idx != -1 {
-					errMsg = errMsg[idx+2:]
-				}
+				errRecord := formatErrorAsHostname(err)
 				timeStr := time.Now().Format("2006-01-02 15:04:05")
 				line := fmt.Sprintf("[gray]%s [gray]│[-] [purple]%15s[-] [gray]│[-] [aqua]%-15s[-] [gray]│[-] [red] ERR [-] [gray]│[-] [gray]%-6s[-] [gray]│[-] [gray]%s[-]\n",
 					timeStr,
 					ip,
 					server,
 					"",
-					errMsg)
+					errRecord)
 				app.QueueUpdateDraw(func() {
 					fmt.Fprint(textView, line)
 					textView.ScrollToEnd()
 				})
+
+				// Write to NDJSON if enabled
+				writeNDJSON(cfg, time.Now(), ip, server, errRecord, "ERR", "", 0)
 			}
 			continue
 		}
@@ -400,7 +400,7 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, t
 		ptr := ""
 		for _, name := range response.Names {
 			if cleaned := strings.TrimSpace(strings.TrimSuffix(name, ".")); cleaned != "" {
-				ptr = cleaned
+				ptr = strings.ToLower(cleaned)
 				break
 			}
 		}
@@ -416,7 +416,7 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, t
 		if response.RecordType == "CNAME" {
 			stats.incrementCNAME()
 			recordTypeColor = "[fuchsia]CNAME[-]"
-			ptr = fmt.Sprintf("%s -> %s", ptr, response.Target)
+			ptr = fmt.Sprintf("%s -> %s", strings.ToLower(ptr), strings.ToLower(response.Target))
 		}
 
 		var line string
@@ -698,7 +698,52 @@ func main() {
 						}
 					}
 
-					if err != nil || len(response.Names) == 0 {
+					if err != nil {
+						if cfg.debug {
+							errRecord := formatErrorAsHostname(err)
+							record := struct {
+								Seen       string `json:"seen"`
+								IP         string `json:"ip"`
+								Nameserver string `json:"nameserver"`
+								Record     string `json:"record"`
+								RecordType string `json:"record_type"`
+								TTL        uint32 `json:"ttl"`
+							}{
+								Seen:       time.Now().Format(time.RFC3339),
+								IP:         ip,
+								Nameserver: server,
+								Record:     errRecord,
+								RecordType: "ERR",
+								TTL:        0,
+							}
+							if data, err := json.Marshal(record); err == nil {
+								fmt.Println(string(data))
+							}
+						}
+						continue
+					}
+
+					if len(response.Names) == 0 {
+						if cfg.debug {
+							record := struct {
+								Seen       string `json:"seen"`
+								IP         string `json:"ip"`
+								Nameserver string `json:"nameserver"`
+								Record     string `json:"record"`
+								RecordType string `json:"record_type"`
+								TTL        uint32 `json:"ttl"`
+							}{
+								Seen:       time.Now().Format(time.RFC3339),
+								IP:         ip,
+								Nameserver: server,
+								Record:     "FAIL.NO-PTR-RECORD.in-addr.arpa",
+								RecordType: "ERR",
+								TTL:        0,
+							}
+							if data, err := json.Marshal(record); err == nil {
+								fmt.Println(string(data))
+							}
+						}
 						continue
 					}
 
@@ -921,5 +966,39 @@ func colorizeTTL(ttl uint32) string {
 		return fmt.Sprintf("[red]%-6d[-]", ttl)
 	default: // Less than 60 seconds
 		return fmt.Sprintf("[gray]%-6d[-]", ttl)
+	}
+}
+
+func formatErrorAsHostname(err error) string {
+	errMsg := err.Error()
+	if idx := strings.LastIndex(errMsg, ": "); idx != -1 {
+		errMsg = errMsg[idx+2:]
+	}
+
+	switch {
+	case strings.Contains(errMsg, "i/o timeout"):
+		return "FAIL.TIMEOUT.in-addr.arpa"
+	case strings.Contains(errMsg, "Server Failure"):
+		return "FAIL.SERVER-FAILURE.in-addr.arpa"
+	case strings.Contains(errMsg, "No Such Domain"):
+		return "FAIL.NON-AUTHORITATIVE.in-addr.arpa"
+	case strings.Contains(errMsg, "refused"):
+		return "FAIL.REFUSED.in-addr.arpa"
+	case strings.Contains(errMsg, "no such host"):
+		return "FAIL.NO-SUCH-HOST.in-addr.arpa"
+	case strings.Contains(errMsg, "connection refused"):
+		return "FAIL.CONNECTION-REFUSED.in-addr.arpa"
+	case strings.Contains(errMsg, "network is unreachable"):
+		return "FAIL.NETWORK-UNREACHABLE.in-addr.arpa"
+	case strings.Contains(errMsg, "no route to host"):
+		return "FAIL.NO-ROUTE.in-addr.arpa"
+	case strings.Contains(errMsg, "Format error"):
+		return "FAIL.FORMAT-ERROR.in-addr.arpa"
+	case strings.Contains(errMsg, "Not Implemented"):
+		return "FAIL.NOT-IMPLEMENTED.in-addr.arpa"
+	case strings.Contains(errMsg, "truncated"):
+		return "FAIL.TRUNCATED.in-addr.arpa"
+	default:
+		return fmt.Sprintf("FAIL.%s.in-addr.arpa", strings.ReplaceAll(strings.ToUpper(errMsg), " ", "-"))
 	}
 }
