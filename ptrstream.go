@@ -901,8 +901,10 @@ func formatErrorAsHostname(err error) string {
 		return "FAIL.SERVER-FAILURE.in-addr.arpa"
 	case strings.Contains(errMsg, "No Such Domain"):
 		return "FAIL.NXDOMAIN.in-addr.arpa"
-	case strings.Contains(errMsg, "refused"):
+	case strings.Contains(errMsg, "Query Refused"):
 		return "FAIL.REFUSED.in-addr.arpa"
+	case strings.Contains(errMsg, "no PTR records found"):
+		return "FAIL.NO-PTR-RECORD.in-addr.arpa"
 	case strings.Contains(errMsg, "no such host"):
 		return "FAIL.NO-SUCH-HOST.in-addr.arpa"
 	case strings.Contains(errMsg, "connection refused"):
@@ -911,7 +913,7 @@ func formatErrorAsHostname(err error) string {
 		return "FAIL.NETWORK-UNREACHABLE.in-addr.arpa"
 	case strings.Contains(errMsg, "no route to host"):
 		return "FAIL.NO-ROUTE.in-addr.arpa"
-	case strings.Contains(errMsg, "Format error"):
+	case strings.Contains(errMsg, "Format Error"):
 		return "FAIL.FORMAT-ERROR.in-addr.arpa"
 	case strings.Contains(errMsg, "Not Implemented"):
 		return "FAIL.NOT-IMPLEMENTED.in-addr.arpa"
