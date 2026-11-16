@@ -60,6 +60,7 @@ type Stats struct {
 	mu            sync.Mutex
 	round         uint64 // 0-based, shown as round+1
 	next          uint64 // next counter value to dispatch
+	track         tracker
 }
 
 func (s *Stats) increment() {
@@ -297,10 +298,6 @@ func parseAnswer(r *dns.Msg) (resp DNSResponse, err error, final bool) {
 	if target != "" {
 		return DNSResponse{Names: []string{target}, RecordType: "CNAME", Target: target, TTL: cnameTTL}, nil, true
 	}
-	if r.Truncated {
-		return DNSResponse{}, fmt.Errorf("truncated"), false
-	}
-
 	// NOERROR without a PTR or CNAME is a final answer too
 	return DNSResponse{}, fmt.Errorf("no PTR records found"), true
 }
@@ -329,9 +326,15 @@ const (
 	wheelTick  = 50 * time.Millisecond // timeout resolution
 )
 
+// job is one IP to look up, with the round it belongs to so progress can be tracked per round
+type job struct {
+	ip    uint32
+	round uint64
+}
+
 // lookup is one IP in flight; sock/id locate it in the engine table for the current attempt
 type lookup struct {
-	ip      uint32
+	job     job
 	query   []byte
 	qlen    int
 	attempt int
@@ -358,14 +361,14 @@ type engine struct {
 	slots  chan struct{}         // one per lookup in flight, caps -c
 	retry  chan *lookup
 	wg     sync.WaitGroup
-	result func(ip, server string, resp DNSResponse, err error)
+	result func(j job, server string, resp DNSResponse, err error)
 
 	wheelMu  sync.Mutex
 	wheel    [][]timeoutEntry
 	wheelPos int
 }
 
-func newEngine(cfg *Config, rate int, result func(ip, server string, resp DNSResponse, err error)) (*engine, error) {
+func newEngine(cfg *Config, rate int, result func(j job, server string, resp DNSResponse, err error)) (*engine, error) {
 	e := &engine{
 		cfg:    cfg,
 		rate:   rate,
@@ -389,7 +392,7 @@ func newEngine(cfg *Config, rate int, result func(ip, server string, resp DNSRes
 }
 
 // run looks up every IP from jobs and returns once all of them have a result
-func (e *engine) run(jobs <-chan uint32) {
+func (e *engine) run(jobs <-chan job) {
 	for i := range e.conns {
 		go e.receive(i)
 	}
@@ -429,8 +432,8 @@ func (e *engine) run(jobs <-chan uint32) {
 			case l := <-e.retry:
 				batch = append(batch, l)
 			case e.slots <- struct{}{}:
-				if ip, ok := <-jobs; ok {
-					batch = append(batch, e.newLookup(ip))
+				if j, ok := <-jobs; ok {
+					batch = append(batch, e.newLookup(j))
 				} else {
 					<-e.slots
 					closeJobs()
@@ -464,13 +467,13 @@ func (e *engine) run(jobs <-chan uint32) {
 				break fill
 			}
 			select {
-			case ip, ok := <-jobs:
+			case j, ok := <-jobs:
 				if !ok {
 					<-e.slots
 					closeJobs()
 					break fill
 				}
-				batch = append(batch, e.newLookup(ip))
+				batch = append(batch, e.newLookup(j))
 			default:
 				<-e.slots
 				break fill
@@ -493,10 +496,10 @@ func (e *engine) run(jobs <-chan uint32) {
 	}
 }
 
-func (e *engine) newLookup(ip uint32) *lookup {
+func (e *engine) newLookup(j job) *lookup {
 	e.wg.Add(1)
-	query, qlen := buildQuery(ip)
-	return &lookup{ip: ip, query: query, qlen: qlen}
+	query, qlen := buildQuery(j.ip)
+	return &lookup{job: j, query: query, qlen: qlen}
 }
 
 // send registers each lookup under a free id on a socket and writes them with sendmmsg
@@ -580,6 +583,17 @@ func (e *engine) handle(l *lookup, buf []byte) {
 		return
 	}
 
+	// a truncated answer is incomplete (and resolvers like Cloudflare send them to busy clients): ask again over TCP
+	if m.Truncated {
+		go e.tcpLookup(l)
+		return
+	}
+
+	e.process(l, m)
+}
+
+// process finishes a lookup on a final answer, or retries it on the next resolver
+func (e *engine) process(l *lookup, m *dns.Msg) {
 	resp, err, final := parseAnswer(m)
 	if !final {
 		l.res.fail()
@@ -588,6 +602,21 @@ func (e *engine) handle(l *lookup, buf []byte) {
 	}
 	l.res.ok()
 	e.finish(l, resp, err)
+}
+
+// tcpLookup repeats a truncated lookup over TCP to the same resolver; it keeps its slot while it runs
+func (e *engine) tcpLookup(l *lookup) {
+	arpa, _ := dns.ReverseAddr(ipToString(l.job.ip))
+	m := new(dns.Msg)
+	m.SetQuestion(arpa, dns.TypePTR)
+
+	r, _, err := (&dns.Client{Net: "tcp", Timeout: e.cfg.timeout}).Exchange(m, l.res.udp.String())
+	if err != nil {
+		// no TCP on this resolver does not make its UDP answers bad, so it is not counted against it
+		e.retryOrFinish(l, fmt.Errorf("truncated"))
+		return
+	}
+	e.process(l, r)
 }
 
 // retryOrFinish queues another attempt on the next resolver, or reports err once -r retries are used up
@@ -601,7 +630,7 @@ func (e *engine) retryOrFinish(l *lookup, err error) {
 }
 
 func (e *engine) finish(l *lookup, resp DNSResponse, err error) {
-	e.result(ipToString(l.ip), l.res.host, resp, err)
+	e.result(l.job, l.res.host, resp, err)
 	<-e.slots
 	e.wg.Done()
 }
@@ -892,14 +921,66 @@ func ipToString(ip uint32) string {
 	return fmt.Sprintf("%d.%d.%d.%d", byte(ip>>24), byte(ip>>16), byte(ip>>8), byte(ip))
 }
 
+const trackBlockSize = 4096 // resume granularity: at most this many IPs are queried again after a restart
+
+// tracker counts unfinished lookups per block of the counter, so the state file can record the lowest
+// position that is not fully done. A lookup that keeps retrying can fall far behind newer ones.
+type tracker struct {
+	mu     sync.Mutex
+	blocks []trackBlock // in dispatch order
+}
+
+type trackBlock struct {
+	round, start uint64
+	pending      int
+}
+
+func (t *tracker) add(round, ctr uint64) {
+	start := ctr - ctr%trackBlockSize
+	t.mu.Lock()
+	if n := len(t.blocks); n > 0 && t.blocks[n-1].round == round && t.blocks[n-1].start == start {
+		t.blocks[n-1].pending++
+	} else {
+		t.blocks = append(t.blocks, trackBlock{round, start, 1})
+	}
+	t.mu.Unlock()
+}
+
+func (t *tracker) done(round, ctr uint64) {
+	start := ctr - ctr%trackBlockSize
+	t.mu.Lock()
+	for i := range t.blocks {
+		if t.blocks[i].round == round && t.blocks[i].start == start {
+			t.blocks[i].pending--
+			break
+		}
+	}
+	for len(t.blocks) > 0 && t.blocks[0].pending == 0 {
+		t.blocks = t.blocks[1:]
+	}
+	t.mu.Unlock()
+}
+
+// watermark returns the 0-based round and position everything before which has finished
+func (t *tracker) watermark(stats *Stats) (uint64, uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.blocks) > 0 {
+		return t.blocks[0].round, t.blocks[0].start
+	}
+	return atomic.LoadUint64(&stats.round), atomic.LoadUint64(&stats.next)
+}
+
 // feed sends every IP of the shard to jobs from the current position, then loops if -l is set.
 // The counter is turned into an IP with the octets reversed (like massdns's ptr.py),
 // so consecutive queries land in different /8s and each /24 is spread across the whole run
-func feed(jobs chan<- uint32, cfg *Config, stats *Stats, start, end uint64) {
+func feed(jobs chan<- job, cfg *Config, stats *Stats, start, end uint64) {
 	for {
+		round := atomic.LoadUint64(&stats.round)
 		for i := atomic.LoadUint64(&stats.next); i < end; i++ {
 			if ip := bits.ReverseBytes32(uint32(i)); cfg.excludes == nil || !excluded(cfg.excludes, ip) {
-				jobs <- ip
+				stats.track.add(round, i)
+				jobs <- job{ip, round}
 			}
 			atomic.StoreUint64(&stats.next, i+1)
 		}
@@ -907,14 +988,17 @@ func feed(jobs chan<- uint32, cfg *Config, stats *Stats, start, end uint64) {
 		if !cfg.loop {
 			break
 		}
+		// round and position change together under the tracker lock so watermark never sees a mix
+		stats.track.mu.Lock()
 		atomic.AddUint64(&stats.round, 1)
 		atomic.StoreUint64(&stats.next, start)
+		stats.track.mu.Unlock()
 	}
 	close(jobs)
 }
 
-// loadState returns the saved round and position, rewound by rewind IPs to cover lookups still in flight
-func loadState(path, shard string, start, end, rewind uint64) (uint64, uint64, error) {
+// loadState returns the saved 0-based round and position
+func loadState(path, shard string, start, end uint64) (uint64, uint64, error) {
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return 0, start, nil
@@ -934,17 +1018,18 @@ func loadState(path, shard string, start, end, rewind uint64) (uint64, uint64, e
 		return 0, 0, fmt.Errorf("state file %s is out of range for shard %s", path, shard)
 	}
 
-	if next-start > rewind {
-		next -= rewind
-	} else {
-		next = start
-	}
 	return round - 1, next, nil
 }
 
-// saveState writes the round and position to path through a temporary file so it is never left half written
-func saveState(path, shard string, stats *Stats) error {
-	line := fmt.Sprintf("shard=%s round=%d next=%d\n", shard, atomic.LoadUint64(&stats.round)+1, atomic.LoadUint64(&stats.next))
+// saveState records the lowest unfinished position. Output is flushed after taking the watermark and before
+// writing the file, so every lookup the file counts as done is already written out. The file goes through a
+// temporary file so it is never left half written.
+func saveState(path, shard string, cfg *Config, stats *Stats) error {
+	round, next := stats.track.watermark(stats)
+	cfg.output.flush()
+	cfg.stdout.flush()
+
+	line := fmt.Sprintf("shard=%s round=%d next=%d\n", shard, round+1, next)
 	if err := os.WriteFile(path+".tmp", []byte(line), 0644); err != nil {
 		return err
 	}
@@ -972,7 +1057,7 @@ func (c *Config) refreshDNSServers() {
 }
 
 func main() {
-	concurrency := flag.Int("c", 100, "Concurrency level")
+	concurrency := flag.Int("c", 10000, "Max lookups in flight")
 	timeout := flag.Duration("t", 2*time.Second, "Timeout for DNS queries")
 	retries := flag.Int("r", 2, "Number of retries for failed lookups")
 	dnsFile := flag.String("dns", "", "File containing DNS servers (one per line)")
@@ -1083,43 +1168,43 @@ func main() {
 
 	shardSpec := fmt.Sprintf("%d/%d", shardNum, totalShards)
 	if *statePath != "" {
-		// in flight at most: the jobs queue plus one lookup per worker
-		stats.round, stats.next, err = loadState(*statePath, shardSpec, shardStart, shardEnd, uint64(2*cfg.concurrency))
+		stats.round, stats.next, err = loadState(*statePath, shardSpec, shardStart, shardEnd)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error loading state: %v\n", err)
 			os.Exit(1)
 		}
 		go func() {
 			for range time.Tick(10 * time.Second) {
-				if err := saveState(*statePath, shardSpec, stats); err != nil {
+				if err := saveState(*statePath, shardSpec, cfg, stats); err != nil {
 					fmt.Fprintf(os.Stderr, "Error saving state: %v\n", err)
 				}
 			}
 		}()
-		defer saveState(*statePath, shardSpec, stats)
+		defer saveState(*statePath, shardSpec, cfg, stats)
 	}
 
-	// on SIGINT/SIGTERM (systemd stop) flush output and save state, lookups in flight are covered by the rewind on load
+	// on SIGINT/SIGTERM (systemd stop) flush output and save state
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigs
-		cfg.output.flush()
-		cfg.stdout.flush()
 		if *statePath != "" {
-			if err := saveState(*statePath, shardSpec, stats); err != nil {
+			if err := saveState(*statePath, shardSpec, cfg, stats); err != nil {
 				fmt.Fprintf(os.Stderr, "Error saving state: %v\n", err)
 			}
 		}
+		cfg.output.flush()
+		cfg.stdout.flush()
 		os.Exit(1)
 	}()
 
-	jobs := make(chan uint32, cfg.concurrency)
+	jobs := make(chan job, cfg.concurrency)
 	go feed(jobs, cfg, stats, shardStart, shardEnd)
 
 	if *jsonOutput {
-		eng, err := newEngine(cfg, *rate, func(ip, server string, resp DNSResponse, err error) {
-			handleResult(cfg, stats, nil, ip, server, resp, err)
+		eng, err := newEngine(cfg, *rate, func(j job, server string, resp DNSResponse, err error) {
+			handleResult(cfg, stats, nil, ipToString(j.ip), server, resp, err)
+			stats.track.done(j.round, uint64(bits.ReverseBytes32(j.ip)))
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error opening sockets: %v\n", err)
@@ -1213,8 +1298,9 @@ func main() {
 		}
 	}()
 
-	eng, err := newEngine(cfg, *rate, func(ip, server string, resp DNSResponse, err error) {
-		handleResult(cfg, stats, textView, ip, server, resp, err)
+	eng, err := newEngine(cfg, *rate, func(j job, server string, resp DNSResponse, err error) {
+		handleResult(cfg, stats, textView, ipToString(j.ip), server, resp, err)
+		stats.track.done(j.round, uint64(bits.ReverseBytes32(j.ip)))
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error opening sockets: %v\n", err)
