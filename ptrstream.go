@@ -11,7 +11,6 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,6 +25,9 @@ import (
 
 const defaultResolversURL = "https://raw.githubusercontent.com/trickest/resolvers/refs/heads/main/resolvers.txt"
 
+// userAgent is a common desktop browser string so the resolver list fetch is not tagged as Go
+const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
+
 type Config struct {
 	concurrency int
 	timeout     time.Duration
@@ -33,7 +35,8 @@ type Config struct {
 	dnsServers  []*resolver
 	serverIndex int
 	debug       bool
-	outputFile  *os.File
+	output      *lineWriter // -o file
+	stdout      *lineWriter // -j
 	mu          sync.Mutex
 	loop        bool
 	excludes    []ipRange
@@ -140,11 +143,21 @@ func (c *Config) activeResolvers() (int, int) {
 }
 
 func fetchDefaultResolvers() ([]string, error) {
-	resp, err := http.Get(defaultResolversURL)
+	req, err := http.NewRequest("GET", defaultResolversURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", userAgent)
+
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch default resolvers: %v", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to fetch default resolvers: %s", resp.Status)
+	}
 
 	var resolvers []string
 	scanner := bufio.NewScanner(resp.Body)
@@ -345,8 +358,8 @@ func colorizeIPInPtr(ptr, ip string) string {
 	octets := strings.Split(ip, ".")
 
 	patterns := []string{
-		strings.ReplaceAll(ip, ".", "\\."),
-		strings.Join(reverse(strings.Split(ip, ".")), "\\."),
+		ip,
+		strings.Join(reverse(strings.Split(ip, ".")), "."),
 		strings.ReplaceAll(ip, ".", "-"),
 		strings.Join(reverse(strings.Split(ip, ".")), "-"),
 	}
@@ -360,10 +373,22 @@ func colorizeIPInPtr(ptr, ip string) string {
 		strings.Join(reverse(zeroPadded), "-"),
 	)
 
-	pattern := strings.Join(patterns, "|")
-	re := regexp.MustCompile("(" + pattern + ")")
-
-	matches := re.FindAllStringIndex(ptr, -1)
+	// leftmost-first, non-overlapping matches of any pattern (same as a regex alternation)
+	var matches [][2]int
+	for i := 0; i < len(ptr); {
+		matched := false
+		for _, p := range patterns {
+			if strings.HasPrefix(ptr[i:], p) {
+				matches = append(matches, [2]int{i, i + len(p)})
+				i += len(p)
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			i++
+		}
+	}
 	if matches == nil {
 		return "[white]" + ptr
 	}
@@ -409,7 +434,8 @@ func parseInt(s string) int {
 
 const maxBufferLines = 1000
 
-func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, textView *tview.TextView, app *tview.Application) {
+// worker writes to textView directly (TextView.Write is goroutine-safe); the stats loop redraws every 100ms
+func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, textView *tview.TextView) {
 	defer wg.Done()
 	for ip := range jobs {
 		timestamp := time.Now()
@@ -435,30 +461,10 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, t
 					server,
 					"",
 					errRecord)
-				app.QueueUpdateDraw(func() {
-					fmt.Fprint(textView, line)
-					textView.ScrollToEnd()
-				})
+				fmt.Fprint(textView, line)
 
 				// Write to NDJSON if enabled
 				writeNDJSON(cfg, time.Now(), ip, server, []string{errRecord}, "ERR", "", 0)
-			}
-			continue
-		}
-
-		if len(response.Names) == 0 {
-			stats.incrementFailed()
-			if cfg.debug {
-				timeStr := time.Now().Format("2006-01-02 15:04:05")
-				line := fmt.Sprintf("[gray]%s [gray]│[-] [purple]%15s[-] [gray]│[-] [aqua]%-15s[-] [gray]│[-] [red] ERR [-] [gray]│[-] [gray]%-6s[-] [gray]│[-] [red]No PTR record[-]\n",
-					timeStr,
-					ip,
-					server,
-					"")
-				app.QueueUpdateDraw(func() {
-					fmt.Fprint(textView, line)
-					textView.ScrollToEnd()
-				})
 			}
 			continue
 		}
@@ -492,17 +498,7 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, t
 			colorizeTTL(response.TTL),
 			colorizeIPInPtr(ptr, ip))
 
-		app.QueueUpdateDraw(func() {
-			fmt.Fprint(textView, line)
-			content := textView.GetText(false)
-			lines := strings.Split(content, "\n")
-			if len(lines) > maxBufferLines {
-				newContent := strings.Join(lines[len(lines)-maxBufferLines:], "\n")
-				textView.Clear()
-				fmt.Fprint(textView, newContent)
-			}
-			textView.ScrollToEnd()
-		})
+		fmt.Fprint(textView, line)
 	}
 }
 
@@ -687,14 +683,14 @@ func main() {
 
 	shardNum, totalShards, err := parseShardArg(*shard)
 	if err != nil {
-		fmt.Printf("Error parsing shard argument: %v\n", err)
-		return
+		fmt.Fprintf(os.Stderr, "Error parsing shard argument: %v\n", err)
+		os.Exit(1)
 	}
 
 	servers, err := loadDNSServers(*dnsFile)
 	if err != nil {
-		fmt.Printf("Error loading DNS servers: %v\n", err)
-		return
+		fmt.Fprintf(os.Stderr, "Error loading DNS servers: %v\n", err)
+		os.Exit(1)
 	}
 
 	cfg := &Config{
@@ -712,29 +708,41 @@ func main() {
 
 	if *excludePath != "" {
 		if cfg.excludes, err = loadExcludes(*excludePath); err != nil {
-			fmt.Printf("Error loading excludes: %v\n", err)
-			return
+			fmt.Fprintf(os.Stderr, "Error loading excludes: %v\n", err)
+			os.Exit(1)
 		}
 	}
 
 	if *outputPath != "" {
 		f, err := os.OpenFile(*outputPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
-			fmt.Printf("Error opening output file: %v\n", err)
-			return
+			fmt.Fprintf(os.Stderr, "Error opening output file: %v\n", err)
+			os.Exit(1)
 		}
-		cfg.outputFile = f
+		cfg.output = newLineWriter(f)
 		defer f.Close()
+		defer cfg.output.flush()
 	}
+
+	if *jsonOutput {
+		cfg.stdout = newLineWriter(os.Stdout)
+		defer cfg.stdout.flush()
+	}
+
+	go func() {
+		for range time.Tick(time.Second) {
+			cfg.output.flush()
+			cfg.stdout.flush()
+		}
+	}()
 
 	app := tview.NewApplication()
 
 	textView := tview.NewTextView().
 		SetDynamicColors(true).
 		SetScrollable(true).
-		SetChangedFunc(func() {
-			app.Draw()
-		})
+		SetMaxLines(maxBufferLines)
+	textView.ScrollToEnd()
 	textView.SetBorder(true).SetTitle(" PTR Records ")
 
 	progress := tview.NewTextView().
@@ -756,13 +764,13 @@ func main() {
 		next:          shardStart,
 	}
 
+	shardSpec := fmt.Sprintf("%d/%d", shardNum, totalShards)
 	if *statePath != "" {
-		shardSpec := fmt.Sprintf("%d/%d", shardNum, totalShards)
 		// in flight at most: the jobs queue plus one lookup per worker
 		stats.round, stats.next, err = loadState(*statePath, shardSpec, shardStart, shardEnd, uint64(2*cfg.concurrency))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error loading state: %v\n", err)
-			return
+			os.Exit(1)
 		}
 		go func() {
 			for range time.Tick(10 * time.Second) {
@@ -772,17 +780,68 @@ func main() {
 			}
 		}()
 		defer saveState(*statePath, shardSpec, stats)
+	}
 
-		// save on SIGINT/SIGTERM too (systemd stop), lookups in flight are covered by the rewind on load
-		sigs := make(chan os.Signal, 1)
-		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-		go func() {
-			<-sigs
+	// on SIGINT/SIGTERM (systemd stop) flush output and save state, lookups in flight are covered by the rewind on load
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigs
+		cfg.output.flush()
+		cfg.stdout.flush()
+		if *statePath != "" {
 			if err := saveState(*statePath, shardSpec, stats); err != nil {
 				fmt.Fprintf(os.Stderr, "Error saving state: %v\n", err)
 			}
-			os.Exit(1)
-		}()
+		}
+		os.Exit(1)
+	}()
+
+	if *jsonOutput {
+		// JSON-only mode
+		jobs := make(chan string, cfg.concurrency)
+		var wg sync.WaitGroup
+
+		// Start workers
+		for i := 0; i < cfg.concurrency; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for ip := range jobs {
+					var response DNSResponse
+					var err error
+					var server string
+
+					response, server, err = lookupWithRetry(ip, cfg)
+					if idx := strings.Index(server, ":"); idx != -1 {
+						server = server[:idx]
+					}
+
+					if err != nil {
+						if cfg.debug {
+							line := formatRecord(time.Now(), ip, server, []string{formatErrorAsHostname(err)}, "ERR", "", 0)
+							cfg.stdout.write(line)
+							cfg.output.write(line)
+						}
+						continue
+					}
+
+					names := cleanNames(response.Names)
+					if len(names) == 0 {
+						continue
+					}
+
+					line := formatRecord(time.Now(), ip, server, names, response.RecordType, response.Target, response.TTL)
+					cfg.stdout.write(line)
+					cfg.output.write(line)
+				}
+			}()
+		}
+
+		// Feed IPs to workers
+		feed(jobs, cfg, stats, shardStart, shardEnd)
+		wg.Wait()
+		return
 	}
 
 	go func() {
@@ -864,65 +923,10 @@ func main() {
 				})
 			}
 
+			app.Draw()
 			time.Sleep(100 * time.Millisecond)
 		}
 	}()
-
-	if *jsonOutput {
-		// JSON-only mode
-		jobs := make(chan string, cfg.concurrency)
-		var wg sync.WaitGroup
-
-		// Start workers
-		for i := 0; i < cfg.concurrency; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for ip := range jobs {
-					var response DNSResponse
-					var err error
-					var server string
-
-					response, server, err = lookupWithRetry(ip, cfg)
-					if idx := strings.Index(server, ":"); idx != -1 {
-						server = server[:idx]
-					}
-
-					if err != nil {
-						if cfg.debug {
-							line := formatRecord(time.Now(), ip, server, []string{formatErrorAsHostname(err)}, "ERR", "", 0)
-							fmt.Println(line)
-							writeLine(cfg, line)
-						}
-						continue
-					}
-
-					if len(response.Names) == 0 {
-						if cfg.debug {
-							line := formatRecord(time.Now(), ip, server, []string{"FAIL.NO-PTR-RECORD.in-addr.arpa"}, "ERR", "", 0)
-							fmt.Println(line)
-							writeLine(cfg, line)
-						}
-						continue
-					}
-
-					names := cleanNames(response.Names)
-					if len(names) == 0 {
-						continue
-					}
-
-					line := formatRecord(time.Now(), ip, server, names, response.RecordType, response.Target, response.TTL)
-					fmt.Println(line)
-					writeLine(cfg, line)
-				}
-			}()
-		}
-
-		// Feed IPs to workers
-		feed(jobs, cfg, stats, shardStart, shardEnd)
-		wg.Wait()
-		return
-	}
 
 	jobs := make(chan string, cfg.concurrency)
 
@@ -931,7 +935,7 @@ func main() {
 	var wg sync.WaitGroup
 	for i := 0; i < cfg.concurrency; i++ {
 		wg.Add(1)
-		go worker(jobs, &wg, cfg, stats, textView, app)
+		go worker(jobs, &wg, cfg, stats, textView)
 	}
 
 	go func() {
@@ -970,11 +974,6 @@ func colorizeSpeed(speed float64) string {
 	default:
 		return fmt.Sprintf("[gray]%5.0f/s[-]", speed)
 	}
-}
-
-func visibleLength(s string) int {
-	noColors := regexp.MustCompile(`\[[a-zA-Z:-]*\]`).ReplaceAllString(s, "")
-	return len(noColors)
 }
 
 // cleanNames trims whitespace and the trailing dot (keeping a bare root "."), lowercases, and drops empty names
@@ -1021,18 +1020,36 @@ func formatRecord(timestamp time.Time, ip, server string, records []string, reco
 }
 
 func writeNDJSON(cfg *Config, timestamp time.Time, ip, server string, records []string, recordType, target string, ttl uint32) {
-	writeLine(cfg, formatRecord(timestamp, ip, server, records, recordType, target, ttl))
+	cfg.output.write(formatRecord(timestamp, ip, server, records, recordType, target, ttl))
 }
 
-// writeLine appends one NDJSON line to the -o file, if set
-func writeLine(cfg *Config, line string) {
-	if cfg.outputFile == nil {
+// lineWriter is a buffered, goroutine-safe line writer; nil means disabled
+type lineWriter struct {
+	mu sync.Mutex
+	w  *bufio.Writer
+}
+
+func newLineWriter(f *os.File) *lineWriter {
+	return &lineWriter{w: bufio.NewWriterSize(f, 64*1024)}
+}
+
+func (l *lineWriter) write(line string) {
+	if l == nil {
 		return
 	}
+	l.mu.Lock()
+	l.w.WriteString(line)
+	l.w.WriteByte('\n')
+	l.mu.Unlock()
+}
 
-	cfg.mu.Lock()
-	cfg.outputFile.WriteString(line + "\n")
-	cfg.mu.Unlock()
+func (l *lineWriter) flush() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	l.w.Flush()
+	l.mu.Unlock()
 }
 
 func formatDuration(d time.Duration) string {
