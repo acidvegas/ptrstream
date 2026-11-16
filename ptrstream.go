@@ -30,7 +30,7 @@ type Config struct {
 	concurrency int
 	timeout     time.Duration
 	retries     int
-	dnsServers  []string
+	dnsServers  []*resolver
 	serverIndex int
 	debug       bool
 	outputFile  *os.File
@@ -70,17 +70,73 @@ func (s *Stats) incrementCNAME() {
 	atomic.AddUint64(&s.cnames, 1)
 }
 
-func (c *Config) getNextServer() string {
+const (
+	benchAfter = 5                // consecutive failures before a resolver is benched
+	benchFor   = 10 * time.Minute // how long a benched resolver is skipped
+)
+
+// resolver is a DNS server with its health: timeouts, REFUSED, SERVFAIL and the like count as failures
+type resolver struct {
+	addr         string
+	fails        int32
+	benchedUntil int64 // unix nanoseconds
+}
+
+func newResolvers(addrs []string) []*resolver {
+	resolvers := make([]*resolver, len(addrs))
+	for i, addr := range addrs {
+		resolvers[i] = &resolver{addr: addr}
+	}
+	return resolvers
+}
+
+func (r *resolver) benched(now int64) bool {
+	return atomic.LoadInt64(&r.benchedUntil) > now
+}
+
+func (r *resolver) ok() {
+	atomic.StoreInt32(&r.fails, 0)
+}
+
+func (r *resolver) fail() {
+	if atomic.AddInt32(&r.fails, 1) >= benchAfter {
+		atomic.StoreInt32(&r.fails, 0)
+		atomic.StoreInt64(&r.benchedUntil, time.Now().Add(benchFor).UnixNano())
+	}
+}
+
+// getNextServer returns the next resolver in rotation that is not benched (or the next one if all are)
+func (c *Config) getNextServer() *resolver {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if len(c.dnsServers) == 0 {
-		return ""
+		return nil
 	}
 
-	server := c.dnsServers[c.serverIndex]
-	c.serverIndex = (c.serverIndex + 1) % len(c.dnsServers)
-	return server
+	now := time.Now().UnixNano()
+	for range c.dnsServers {
+		r := c.dnsServers[c.serverIndex]
+		c.serverIndex = (c.serverIndex + 1) % len(c.dnsServers)
+		if !r.benched(now) {
+			return r
+		}
+	}
+	return c.dnsServers[c.serverIndex]
+}
+
+// activeResolvers counts the resolvers that are not benched
+func (c *Config) activeResolvers() (int, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now, active := time.Now().UnixNano(), 0
+	for _, r := range c.dnsServers {
+		if !r.benched(now) {
+			active++
+		}
+	}
+	return active, len(c.dnsServers)
 }
 
 func fetchDefaultResolvers() ([]string, error) {
@@ -185,10 +241,11 @@ func lookupWithRetry(ip string, cfg *Config) (DNSResponse, string, error) {
 	var lastServer string
 
 	for i := 0; i <= cfg.retries; i++ {
-		server := cfg.getNextServer()
-		if server == "" {
+		res := cfg.getNextServer()
+		if res == nil {
 			return DNSResponse{}, "", fmt.Errorf("no DNS servers available")
 		}
+		server := res.addr
 		lastServer = server
 
 		// Create DNS message
@@ -207,18 +264,22 @@ func lookupWithRetry(ip string, cfg *Config) (DNSResponse, string, error) {
 		// Make the query
 		r, _, err := c.Exchange(m, server)
 		if err != nil {
+			res.fail()
 			lastErr = err
 			continue
 		}
 
 		// NXDOMAIN is a final answer, other error codes are retried on the next server
 		if r.Rcode == dns.RcodeNameError {
+			res.ok()
 			return DNSResponse{}, server, fmt.Errorf("%s", translateRcode(r.Rcode))
 		}
 		if r.Rcode != dns.RcodeSuccess {
+			res.fail()
 			lastErr = fmt.Errorf("%s", translateRcode(r.Rcode))
 			continue
 		}
+		res.ok()
 
 		// Process the response
 		if len(r.Answer) > 0 {
@@ -604,7 +665,7 @@ func (c *Config) refreshDNSServers() {
 			continue
 		}
 		c.mu.Lock()
-		c.dnsServers = resolvers
+		c.dnsServers = newResolvers(resolvers)
 		c.serverIndex = 0
 		c.mu.Unlock()
 	}
@@ -641,7 +702,7 @@ func main() {
 		timeout:     *timeout,
 		retries:     *retries,
 		debug:       *debug,
-		dnsServers:  servers,
+		dnsServers:  newResolvers(servers),
 		loop:        *loop,
 	}
 
@@ -756,6 +817,7 @@ func main() {
 				stats.mu.Unlock()
 
 				percent := float64(atomic.LoadUint64(&stats.next)-shardStart) / float64(stats.total) * 100
+				active, totalResolvers := cfg.activeResolvers()
 
 				app.QueueUpdateDraw(func() {
 					var width int
@@ -765,7 +827,7 @@ func main() {
 					}
 
 					// First line: stats
-					statsLine := fmt.Sprintf(" [aqua]Elapsed:[:-] [white]%s [gray]│[-] [aqua]Round:[:-] [white]%d [gray]│[-] [aqua]Count:[:-] [white]%s [gray]│[-] [aqua]Progress:[:-] [darkgray]%.2f%%[-] [gray]│[-] [aqua]Rate:[:-] %s [gray]│[-] [aqua]CNAMEs:[:-] [yellow]%s[-][darkgray] (%.1f%%)[-] [gray]│[-] [aqua]Successful:[:-] [green]✓ %s[-][darkgray] (%.1f%%)[-] [gray]│[-] [aqua]Failed:[:-] [red]✗ %s[-][darkgray] (%.1f%%)[-]\n",
+					statsLine := fmt.Sprintf(" [aqua]Elapsed:[:-] [white]%s [gray]│[-] [aqua]Round:[:-] [white]%d [gray]│[-] [aqua]Count:[:-] [white]%s [gray]│[-] [aqua]Progress:[:-] [darkgray]%.2f%%[-] [gray]│[-] [aqua]Rate:[:-] %s [gray]│[-] [aqua]CNAMEs:[:-] [yellow]%s[-][darkgray] (%.1f%%)[-] [gray]│[-] [aqua]Successful:[:-] [green]✓ %s[-][darkgray] (%.1f%%)[-] [gray]│[-] [aqua]Failed:[:-] [red]✗ %s[-][darkgray] (%.1f%%)[-] [gray]│[-] [aqua]Resolvers:[:-] [white]%d/%d[-]\n",
 						formatDuration(time.Since(stats.startTime)),
 						atomic.LoadUint64(&stats.round)+1,
 						formatNumber(processed),
@@ -776,7 +838,8 @@ func main() {
 						formatNumber(success),
 						float64(success)/float64(processed)*100,
 						formatNumber(failed),
-						float64(failed)/float64(processed)*100)
+						float64(failed)/float64(processed)*100,
+						active, totalResolvers)
 
 					// Second line: progress bar
 					barWidth := width - 3 // -3 for the [] and space
@@ -914,11 +977,15 @@ func visibleLength(s string) int {
 	return len(noColors)
 }
 
-// cleanNames trims the trailing dot and whitespace, lowercases, and drops empty names
+// cleanNames trims whitespace and the trailing dot (keeping a bare root "."), lowercases, and drops empty names
 func cleanNames(names []string) []string {
 	var cleaned []string
 	for _, name := range names {
-		if name = strings.ToLower(strings.TrimSpace(strings.TrimSuffix(name, "."))); name != "" {
+		name = strings.ToLower(strings.TrimSpace(name))
+		if name != "." {
+			name = strings.TrimSuffix(name, ".")
+		}
+		if name != "" {
 			cleaned = append(cleaned, name)
 		}
 	}
