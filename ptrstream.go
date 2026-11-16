@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"regexp"
@@ -22,17 +21,15 @@ import (
 const defaultResolversURL = "https://raw.githubusercontent.com/trickest/resolvers/refs/heads/main/resolvers.txt"
 
 type Config struct {
-	concurrency   int
-	timeout       time.Duration
-	retries       int
-	dnsServers    []string
-	serverIndex   int
-	debug         bool
-	outputFile    *os.File
-	mu            sync.Mutex
-	lastDNSUpdate time.Time
-	updateMu      sync.Mutex
-	loop          bool
+	concurrency int
+	timeout     time.Duration
+	retries     int
+	dnsServers  []string
+	serverIndex int
+	debug       bool
+	outputFile  *os.File
+	mu          sync.Mutex
+	loop        bool
 }
 
 type Stats struct {
@@ -66,10 +63,6 @@ func (s *Stats) incrementCNAME() {
 }
 
 func (c *Config) getNextServer() string {
-	if err := c.updateDNSServers(); err != nil {
-		fmt.Printf("Failed to update DNS servers: %v\n", err)
-	}
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -114,7 +107,7 @@ func loadDNSServers(dnsFile string) ([]string, error) {
 		if len(resolvers) == 0 {
 			return nil, fmt.Errorf("no default resolvers found")
 		}
-		return resolvers, nil
+		return addDefaultPort(resolvers), nil
 	}
 
 	file, err := os.Open(dnsFile)
@@ -140,7 +133,16 @@ func loadDNSServers(dnsFile string) ([]string, error) {
 		return nil, fmt.Errorf("no DNS servers found in file")
 	}
 
-	return servers, nil
+	return addDefaultPort(servers), nil
+}
+
+func addDefaultPort(servers []string) []string {
+	for i, server := range servers {
+		if !strings.Contains(server, ":") {
+			servers[i] = server + ":53"
+		}
+	}
+	return servers
 }
 
 type DNSResponse struct {
@@ -174,7 +176,7 @@ func lookupWithRetry(ip string, cfg *Config) (DNSResponse, string, error) {
 	var lastErr error
 	var lastServer string
 
-	for i := 0; i < cfg.retries; i++ {
+	for i := 0; i <= cfg.retries; i++ {
 		server := cfg.getNextServer()
 		if server == "" {
 			return DNSResponse{}, "", fmt.Errorf("no DNS servers available")
@@ -201,6 +203,10 @@ func lookupWithRetry(ip string, cfg *Config) (DNSResponse, string, error) {
 			continue
 		}
 
+		// NXDOMAIN is a final answer, other error codes are retried on the next server
+		if r.Rcode == dns.RcodeNameError {
+			return DNSResponse{}, server, fmt.Errorf("%s", translateRcode(r.Rcode))
+		}
 		if r.Rcode != dns.RcodeSuccess {
 			lastErr = fmt.Errorf("%s", translateRcode(r.Rcode))
 			continue
@@ -244,7 +250,8 @@ func lookupWithRetry(ip string, cfg *Config) (DNSResponse, string, error) {
 			}
 		}
 
-		lastErr = fmt.Errorf("no PTR records found")
+		// NOERROR without a PTR or CNAME is a final answer too
+		return DNSResponse{}, server, fmt.Errorf("no PTR records found")
 	}
 
 	return DNSResponse{}, lastServer, lastErr
@@ -341,16 +348,9 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, t
 		var err error
 		var server string
 
-		if len(cfg.dnsServers) > 0 {
-			response, server, err = lookupWithRetry(ip, cfg)
-			if idx := strings.Index(server, ":"); idx != -1 {
-				server = server[:idx]
-			}
-		} else {
-			names, err := net.LookupAddr(ip)
-			if err == nil {
-				response = DNSResponse{Names: names, RecordType: "PTR"}
-			}
+		response, server, err = lookupWithRetry(ip, cfg)
+		if idx := strings.Index(server, ":"); idx != -1 {
+			server = server[:idx]
 		}
 
 		stats.increment()
@@ -372,7 +372,7 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, t
 				})
 
 				// Write to NDJSON if enabled
-				writeNDJSON(cfg, time.Now(), ip, server, errRecord, "ERR", "", 0)
+				writeNDJSON(cfg, time.Now(), ip, server, []string{errRecord}, "ERR", "", 0)
 			}
 			continue
 		}
@@ -396,19 +396,13 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, t
 
 		stats.incrementSuccess()
 
-		ptr := ""
-		for _, name := range response.Names {
-			if cleaned := strings.TrimSpace(strings.TrimSuffix(name, ".")); cleaned != "" {
-				ptr = strings.ToLower(cleaned)
-				break
-			}
-		}
-
-		if ptr == "" {
+		names := cleanNames(response.Names)
+		if len(names) == 0 {
 			continue
 		}
 
-		writeNDJSON(cfg, timestamp, ip, server, ptr, response.RecordType, response.Target, response.TTL)
+		writeNDJSON(cfg, timestamp, ip, server, names, response.RecordType, response.Target, response.TTL)
+		ptr := strings.Join(names, ", ")
 
 		timeStr := time.Now().Format("2006-01-02 15:04:05")
 		recordTypeColor := "[blue] PTR [-]"
@@ -421,23 +415,13 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, t
 			ptr = fmt.Sprintf("%s -> %s", strings.ToLower(response.Target), ptr)
 		}
 
-		var line string
-		if len(cfg.dnsServers) > 0 {
-			line = fmt.Sprintf("[gray]%s [gray]│[-] [purple]%15s[-] [gray]│[-] [aqua]%-15s[-] [gray]│[-] %-5s [gray]│[-] %s [gray]│[-] %s\n",
-				timeStr,
-				ip,
-				server,
-				recordTypeColor,
-				colorizeTTL(response.TTL),
-				colorizeIPInPtr(ptr, ip))
-		} else {
-			line = fmt.Sprintf("[gray]%s [gray]│[-] [purple]%15s[-] [gray]│[-] %-5s [gray]│[-] %s [gray]│[-] %s\n",
-				timeStr,
-				ip,
-				recordTypeColor,
-				colorizeTTL(response.TTL),
-				colorizeIPInPtr(ptr, ip))
-		}
+		line := fmt.Sprintf("[gray]%s [gray]│[-] [purple]%15s[-] [gray]│[-] [aqua]%-15s[-] [gray]│[-] %-5s [gray]│[-] %s [gray]│[-] %s\n",
+			timeStr,
+			ip,
+			server,
+			recordTypeColor,
+			colorizeTTL(response.TTL),
+			colorizeIPInPtr(ptr, ip))
 
 		app.QueueUpdateDraw(func() {
 			fmt.Fprint(textView, line)
@@ -502,36 +486,19 @@ func ipStream(shardNum, totalShards int) <-chan string {
 	return out
 }
 
-func (c *Config) updateDNSServers() error {
-	c.updateMu.Lock()
-	defer c.updateMu.Unlock()
-
-	if time.Since(c.lastDNSUpdate) < 24*time.Hour {
-		return nil
-	}
-
-	resolvers, err := fetchDefaultResolvers()
-	if err != nil {
-		return err
-	}
-
-	if len(resolvers) == 0 {
-		return fmt.Errorf("no resolvers found in update")
-	}
-
-	for i, server := range resolvers {
-		if !strings.Contains(server, ":") {
-			resolvers[i] = server + ":53"
+// refreshDNSServers re-fetches the default resolver list every 24 hours (only used without -dns)
+func (c *Config) refreshDNSServers() {
+	for range time.Tick(24 * time.Hour) {
+		resolvers, err := loadDNSServers("")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to update DNS servers: %v\n", err)
+			continue
 		}
+		c.mu.Lock()
+		c.dnsServers = resolvers
+		c.serverIndex = 0
+		c.mu.Unlock()
 	}
-
-	c.mu.Lock()
-	c.dnsServers = resolvers
-	c.serverIndex = 0
-	c.lastDNSUpdate = time.Now()
-	c.mu.Unlock()
-
-	return nil
 }
 
 func main() {
@@ -558,20 +525,17 @@ func main() {
 		return
 	}
 
-	for i, server := range servers {
-		if !strings.Contains(server, ":") {
-			servers[i] = server + ":53"
-		}
+	cfg := &Config{
+		concurrency: *concurrency,
+		timeout:     *timeout,
+		retries:     *retries,
+		debug:       *debug,
+		dnsServers:  servers,
+		loop:        *loop,
 	}
 
-	cfg := &Config{
-		concurrency:   *concurrency,
-		timeout:       *timeout,
-		retries:       *retries,
-		debug:         *debug,
-		dnsServers:    servers,
-		lastDNSUpdate: time.Now(),
-		loop:          *loop,
+	if *dnsFile == "" {
+		go cfg.refreshDNSServers()
 	}
 
 	if *outputPath != "" {
@@ -708,103 +672,31 @@ func main() {
 					var err error
 					var server string
 
-					if len(cfg.dnsServers) > 0 {
-						response, server, err = lookupWithRetry(ip, cfg)
-						if idx := strings.Index(server, ":"); idx != -1 {
-							server = server[:idx]
-						}
-					} else {
-						names, err := net.LookupAddr(ip)
-						if err == nil {
-							response = DNSResponse{Names: names, RecordType: "PTR"}
-						}
+					response, server, err = lookupWithRetry(ip, cfg)
+					if idx := strings.Index(server, ":"); idx != -1 {
+						server = server[:idx]
 					}
 
 					if err != nil {
 						if cfg.debug {
-							errRecord := formatErrorAsHostname(err)
-							record := struct {
-								Seen       string `json:"seen"`
-								IP         string `json:"ip"`
-								Nameserver string `json:"nameserver"`
-								Record     string `json:"record"`
-								RecordType string `json:"record_type"`
-								TTL        uint32 `json:"ttl"`
-							}{
-								Seen:       time.Now().Format(time.RFC3339),
-								IP:         ip,
-								Nameserver: server,
-								Record:     errRecord,
-								RecordType: "ERR",
-								TTL:        0,
-							}
-							if data, err := json.Marshal(record); err == nil {
-								fmt.Println(string(data))
-							}
+							fmt.Println(formatRecord(time.Now(), ip, server, []string{formatErrorAsHostname(err)}, "ERR", "", 0))
 						}
 						continue
 					}
 
 					if len(response.Names) == 0 {
 						if cfg.debug {
-							record := struct {
-								Seen       string `json:"seen"`
-								IP         string `json:"ip"`
-								Nameserver string `json:"nameserver"`
-								Record     string `json:"record"`
-								RecordType string `json:"record_type"`
-								TTL        uint32 `json:"ttl"`
-							}{
-								Seen:       time.Now().Format(time.RFC3339),
-								IP:         ip,
-								Nameserver: server,
-								Record:     "FAIL.NO-PTR-RECORD.in-addr.arpa",
-								RecordType: "ERR",
-								TTL:        0,
-							}
-							if data, err := json.Marshal(record); err == nil {
-								fmt.Println(string(data))
-							}
+							fmt.Println(formatRecord(time.Now(), ip, server, []string{"FAIL.NO-PTR-RECORD.in-addr.arpa"}, "ERR", "", 0))
 						}
 						continue
 					}
 
-					ptr := ""
-					for _, name := range response.Names {
-						if cleaned := strings.TrimSpace(strings.TrimSuffix(name, ".")); cleaned != "" {
-							ptr = cleaned
-							break
-						}
-					}
-
-					if ptr == "" {
+					names := cleanNames(response.Names)
+					if len(names) == 0 {
 						continue
 					}
 
-					record := struct {
-						Seen       string `json:"seen"`
-						IP         string `json:"ip"`
-						Nameserver string `json:"nameserver"`
-						Record     string `json:"record"`
-						RecordType string `json:"record_type"`
-						CNAME      string `json:"cname,omitempty"`
-						TTL        uint32 `json:"ttl"`
-					}{
-						Seen:       time.Now().Format(time.RFC3339),
-						IP:         ip,
-						Nameserver: server,
-						Record:     ptr,
-						RecordType: response.RecordType,
-						TTL:        response.TTL,
-					}
-
-					if response.RecordType == "PTR" {
-						record.CNAME = response.Target
-					}
-
-					if data, err := json.Marshal(record); err == nil {
-						fmt.Println(string(data))
-					}
+					fmt.Println(formatRecord(time.Now(), ip, server, names, response.RecordType, response.Target, response.TTL))
 				}
 			}()
 		}
@@ -888,24 +780,32 @@ func visibleLength(s string) int {
 	return len(noColors)
 }
 
-func writeNDJSON(cfg *Config, timestamp time.Time, ip, server, ptr, recordType, target string, ttl uint32) {
-	if cfg.outputFile == nil {
-		return
+// cleanNames trims the trailing dot and whitespace, lowercases, and drops empty names
+func cleanNames(names []string) []string {
+	var cleaned []string
+	for _, name := range names {
+		if name = strings.ToLower(strings.TrimSpace(strings.TrimSuffix(name, "."))); name != "" {
+			cleaned = append(cleaned, name)
+		}
 	}
+	return cleaned
+}
 
+// formatRecord returns one NDJSON line (without newline) for a result
+func formatRecord(timestamp time.Time, ip, server string, records []string, recordType, target string, ttl uint32) string {
 	record := struct {
-		Seen       string `json:"seen"`
-		IP         string `json:"ip"`
-		Nameserver string `json:"nameserver"`
-		Record     string `json:"record"`
-		RecordType string `json:"record_type"`
-		CNAME      string `json:"cname,omitempty"`
-		TTL        uint32 `json:"ttl"`
+		Seen       string   `json:"seen"`
+		IP         string   `json:"ip"`
+		Nameserver string   `json:"nameserver"`
+		Record     []string `json:"record"`
+		RecordType string   `json:"record_type"`
+		CNAME      string   `json:"cname,omitempty"`
+		TTL        uint32   `json:"ttl"`
 	}{
 		Seen:       timestamp.Format(time.RFC3339),
 		IP:         ip,
 		Nameserver: server,
-		Record:     ptr,
+		Record:     records,
 		RecordType: recordType,
 		TTL:        ttl,
 	}
@@ -915,12 +815,19 @@ func writeNDJSON(cfg *Config, timestamp time.Time, ip, server, ptr, recordType, 
 		record.CNAME = target
 	}
 
-	if data, err := json.Marshal(record); err == nil {
-		cfg.mu.Lock()
-		cfg.outputFile.Write(data)
-		cfg.outputFile.Write([]byte("\n"))
-		cfg.mu.Unlock()
+	data, _ := json.Marshal(record)
+	return string(data)
+}
+
+func writeNDJSON(cfg *Config, timestamp time.Time, ip, server string, records []string, recordType, target string, ttl uint32) {
+	if cfg.outputFile == nil {
+		return
 	}
+
+	line := formatRecord(timestamp, ip, server, records, recordType, target, ttl) + "\n"
+	cfg.mu.Lock()
+	cfg.outputFile.WriteString(line)
+	cfg.mu.Unlock()
 }
 
 func formatDuration(d time.Duration) string {
@@ -993,7 +900,7 @@ func formatErrorAsHostname(err error) string {
 	case strings.Contains(errMsg, "Server Failure"):
 		return "FAIL.SERVER-FAILURE.in-addr.arpa"
 	case strings.Contains(errMsg, "No Such Domain"):
-		return "FAIL.NON-AUTHORITATIVE.in-addr.arpa"
+		return "FAIL.NXDOMAIN.in-addr.arpa"
 	case strings.Contains(errMsg, "refused"):
 		return "FAIL.REFUSED.in-addr.arpa"
 	case strings.Contains(errMsg, "no such host"):
