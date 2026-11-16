@@ -147,7 +147,7 @@ type DNSResponse struct {
 	Names      []string
 	Server     string
 	RecordType string // "PTR" or "CNAME"
-	Target     string // For CNAME records, stores the target
+	Target     string // CNAME target, if the answer had one
 	TTL        uint32 // Add TTL field
 }
 
@@ -209,38 +209,37 @@ func lookupWithRetry(ip string, cfg *Config) (DNSResponse, string, error) {
 		// Process the response
 		if len(r.Answer) > 0 {
 			var names []string
-			var ttl uint32
-			var isCNAME bool
+			var ptrTTL, cnameTTL uint32
 			var target string
 
 			for _, ans := range r.Answer {
 				switch rr := ans.(type) {
 				case *dns.PTR:
 					names = append(names, rr.Ptr)
-					ttl = rr.Hdr.Ttl
+					ptrTTL = rr.Hdr.Ttl
 				case *dns.CNAME:
-					isCNAME = true
-					names = append(names, rr.Hdr.Name)
-					target = rr.Target
-					ttl = rr.Hdr.Ttl
+					target = strings.TrimSuffix(rr.Target, ".")
+					cnameTTL = rr.Hdr.Ttl
 				}
 			}
 
+			// RFC 2317: a CNAME followed by the PTR it points to is a PTR answer
 			if len(names) > 0 {
-				if isCNAME {
-					return DNSResponse{
-						Names:      names,
-						Server:     server,
-						RecordType: "CNAME",
-						Target:     strings.TrimSuffix(target, "."),
-						TTL:        ttl,
-					}, server, nil
-				}
 				return DNSResponse{
 					Names:      names,
 					Server:     server,
 					RecordType: "PTR",
-					TTL:        ttl,
+					Target:     target,
+					TTL:        ptrTTL,
+				}, server, nil
+			}
+			if target != "" {
+				return DNSResponse{
+					Names:      []string{target},
+					Server:     server,
+					RecordType: "CNAME",
+					Target:     target,
+					TTL:        cnameTTL,
 				}, server, nil
 			}
 		}
@@ -413,10 +412,13 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, t
 
 		timeStr := time.Now().Format("2006-01-02 15:04:05")
 		recordTypeColor := "[blue] PTR [-]"
-		if response.RecordType == "CNAME" {
+		if response.Target != "" {
 			stats.incrementCNAME()
+		}
+		if response.RecordType == "CNAME" {
 			recordTypeColor = "[fuchsia]CNAME[-]"
-			ptr = fmt.Sprintf("%s -> %s", strings.ToLower(ptr), strings.ToLower(response.Target))
+		} else if response.Target != "" {
+			ptr = fmt.Sprintf("%s -> %s", strings.ToLower(response.Target), ptr)
 		}
 
 		var line string
@@ -785,18 +787,19 @@ func main() {
 						Nameserver string `json:"nameserver"`
 						Record     string `json:"record"`
 						RecordType string `json:"record_type"`
+						CNAME      string `json:"cname,omitempty"`
 						TTL        uint32 `json:"ttl"`
 					}{
 						Seen:       time.Now().Format(time.RFC3339),
 						IP:         ip,
 						Nameserver: server,
-						Record:     response.Target,
+						Record:     ptr,
 						RecordType: response.RecordType,
 						TTL:        response.TTL,
 					}
 
-					if response.RecordType != "CNAME" {
-						record.Record = ptr
+					if response.RecordType == "PTR" {
+						record.CNAME = response.Target
 					}
 
 					if data, err := json.Marshal(record); err == nil {
@@ -896,19 +899,20 @@ func writeNDJSON(cfg *Config, timestamp time.Time, ip, server, ptr, recordType, 
 		Nameserver string `json:"nameserver"`
 		Record     string `json:"record"`
 		RecordType string `json:"record_type"`
+		CNAME      string `json:"cname,omitempty"`
 		TTL        uint32 `json:"ttl"`
 	}{
 		Seen:       timestamp.Format(time.RFC3339),
 		IP:         ip,
 		Nameserver: server,
-		Record:     target, // For CNAME records, use the target
+		Record:     ptr,
 		RecordType: recordType,
 		TTL:        ttl,
 	}
 
-	// If it's not a CNAME, use the PTR record
-	if recordType != "CNAME" {
-		record.Record = ptr
+	// RFC 2317 PTR reached through a CNAME
+	if recordType == "PTR" {
+		record.CNAME = target
 	}
 
 	if data, err := json.Marshal(record); err == nil {
