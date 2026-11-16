@@ -2,11 +2,15 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"math/bits"
+	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/netip"
 	"os"
@@ -21,6 +25,7 @@ import (
 
 	"github.com/miekg/dns"
 	"github.com/rivo/tview"
+	"golang.org/x/net/ipv4"
 )
 
 const defaultResolversURL = "https://raw.githubusercontent.com/trickest/resolvers/refs/heads/main/resolvers.txt"
@@ -80,17 +85,27 @@ const (
 
 // resolver is a DNS server with its health: timeouts, REFUSED, SERVFAIL and the like count as failures
 type resolver struct {
-	addr         string
+	host         string // IP without port, for output
+	udp          *net.UDPAddr
 	fails        int32
 	benchedUntil int64 // unix nanoseconds
 }
 
-func newResolvers(addrs []string) []*resolver {
-	resolvers := make([]*resolver, len(addrs))
-	for i, addr := range addrs {
-		resolvers[i] = &resolver{addr: addr}
+// newResolvers parses ip:port addresses, skipping anything that is not IPv4 (the query sockets are IPv4)
+func newResolvers(addrs []string) ([]*resolver, error) {
+	var resolvers []*resolver
+	for _, addr := range addrs {
+		ap, err := netip.ParseAddrPort(addr)
+		if err != nil || !ap.Addr().Is4() {
+			fmt.Fprintf(os.Stderr, "Skipping resolver %q: not an IPv4 address\n", addr)
+			continue
+		}
+		resolvers = append(resolvers, &resolver{host: ap.Addr().String(), udp: net.UDPAddrFromAddrPort(ap)})
 	}
-	return resolvers
+	if len(resolvers) == 0 {
+		return nil, fmt.Errorf("no usable IPv4 resolvers")
+	}
+	return resolvers, nil
 }
 
 func (r *resolver) benched(now int64) bool {
@@ -224,7 +239,6 @@ func addDefaultPort(servers []string) []string {
 
 type DNSResponse struct {
 	Names      []string
-	Server     string
 	RecordType string // "PTR" or "CNAME"
 	Target     string // CNAME target, if the answer had one
 	TTL        uint32 // Add TTL field
@@ -249,94 +263,387 @@ func translateRcode(rcode int) string {
 	}
 }
 
-func lookupWithRetry(ip string, cfg *Config) (DNSResponse, string, error) {
-	var lastErr error
-	var lastServer string
+var errTimeout = errors.New("i/o timeout")
 
-	for i := 0; i <= cfg.retries; i++ {
-		res := cfg.getNextServer()
-		if res == nil {
-			return DNSResponse{}, "", fmt.Errorf("no DNS servers available")
-		}
-		server := res.addr
-		lastServer = server
-
-		// Create DNS message
-		m := new(dns.Msg)
-		arpa, err := dns.ReverseAddr(ip)
-		if err != nil {
-			return DNSResponse{}, "", err
-		}
-		m.SetQuestion(arpa, dns.TypePTR)
-		m.RecursionDesired = true
-
-		// Create DNS client
-		c := new(dns.Client)
-		c.Timeout = cfg.timeout
-
-		// Make the query
-		r, _, err := c.Exchange(m, server)
-		if err != nil {
-			res.fail()
-			lastErr = err
-			continue
-		}
-
-		// NXDOMAIN is a final answer, other error codes are retried on the next server
-		if r.Rcode == dns.RcodeNameError {
-			res.ok()
-			return DNSResponse{}, server, fmt.Errorf("%s", translateRcode(r.Rcode))
-		}
-		if r.Rcode != dns.RcodeSuccess {
-			res.fail()
-			lastErr = fmt.Errorf("%s", translateRcode(r.Rcode))
-			continue
-		}
-		res.ok()
-
-		// Process the response
-		if len(r.Answer) > 0 {
-			var names []string
-			var ptrTTL, cnameTTL uint32
-			var target string
-
-			for _, ans := range r.Answer {
-				switch rr := ans.(type) {
-				case *dns.PTR:
-					names = append(names, rr.Ptr)
-					ptrTTL = rr.Hdr.Ttl
-				case *dns.CNAME:
-					target = strings.TrimSuffix(rr.Target, ".")
-					cnameTTL = rr.Hdr.Ttl
-				}
-			}
-
-			// RFC 2317: a CNAME followed by the PTR it points to is a PTR answer
-			if len(names) > 0 {
-				return DNSResponse{
-					Names:      names,
-					Server:     server,
-					RecordType: "PTR",
-					Target:     target,
-					TTL:        ptrTTL,
-				}, server, nil
-			}
-			if target != "" {
-				return DNSResponse{
-					Names:      []string{target},
-					Server:     server,
-					RecordType: "CNAME",
-					Target:     target,
-					TTL:        cnameTTL,
-				}, server, nil
-			}
-		}
-
-		// NOERROR without a PTR or CNAME is a final answer too
-		return DNSResponse{}, server, fmt.Errorf("no PTR records found")
+// parseAnswer interprets a response; final is false for errors worth retrying on another resolver
+func parseAnswer(r *dns.Msg) (resp DNSResponse, err error, final bool) {
+	// NXDOMAIN is a final answer, other error codes are retried on the next server
+	if r.Rcode == dns.RcodeNameError {
+		return DNSResponse{}, fmt.Errorf("%s", translateRcode(r.Rcode)), true
+	}
+	if r.Rcode != dns.RcodeSuccess {
+		return DNSResponse{}, fmt.Errorf("%s", translateRcode(r.Rcode)), false
 	}
 
-	return DNSResponse{}, lastServer, lastErr
+	var names []string
+	var ptrTTL, cnameTTL uint32
+	var target string
+
+	for _, ans := range r.Answer {
+		switch rr := ans.(type) {
+		case *dns.PTR:
+			names = append(names, rr.Ptr)
+			ptrTTL = rr.Hdr.Ttl
+		case *dns.CNAME:
+			target = strings.TrimSuffix(rr.Target, ".")
+			cnameTTL = rr.Hdr.Ttl
+		}
+	}
+
+	// RFC 2317: a CNAME followed by the PTR it points to is a PTR answer
+	if len(names) > 0 {
+		return DNSResponse{Names: names, RecordType: "PTR", Target: target, TTL: ptrTTL}, nil, true
+	}
+	if target != "" {
+		return DNSResponse{Names: []string{target}, RecordType: "CNAME", Target: target, TTL: cnameTTL}, nil, true
+	}
+	if r.Truncated {
+		return DNSResponse{}, fmt.Errorf("truncated"), false
+	}
+
+	// NOERROR without a PTR or CNAME is a final answer too
+	return DNSResponse{}, fmt.Errorf("no PTR records found"), true
+}
+
+// buildQuery returns a PTR query for ip (id left as 0) with an EDNS0 OPT record for 1232 byte answers,
+// and the length of the question section that answers must echo
+func buildQuery(ip uint32) ([]byte, int) {
+	q := make([]byte, 12, 64)
+	q[2] = 0x01 // RD
+	q[5] = 1    // QDCOUNT
+	q[11] = 1   // ARCOUNT
+	for i := 0; i < 4; i++ {
+		octet := strconv.Itoa(int(byte(ip >> (8 * i))))
+		q = append(q, byte(len(octet)))
+		q = append(q, octet...)
+	}
+	q = append(q, 7, 'i', 'n', '-', 'a', 'd', 'd', 'r', 4, 'a', 'r', 'p', 'a', 0, 0, 12, 0, 1)
+	qlen := len(q) - 12
+	q = append(q, 0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0, 0, 0) // OPT: root, type 41, UDP size 1232
+	return q, qlen
+}
+
+const (
+	numSockets = 4                     // long-lived query sockets
+	batchSize  = 64                    // packets per sendmmsg/recvmmsg call
+	wheelTick  = 50 * time.Millisecond // timeout resolution
+)
+
+// lookup is one IP in flight; sock/id locate it in the engine table for the current attempt
+type lookup struct {
+	ip      uint32
+	query   []byte
+	qlen    int
+	attempt int
+	res     *resolver
+	sock    int
+	id      uint16
+}
+
+type timeoutEntry struct {
+	l       *lookup
+	sock    int
+	id      uint16
+	attempt int
+}
+
+// engine sends queries from a few UDP sockets in batches and matches answers by socket, id, source and question
+type engine struct {
+	cfg    *Config
+	rate   int
+	conns  []*net.UDPConn
+	pconns []*ipv4.PacketConn
+	mu     [numSockets]sync.Mutex
+	table  [numSockets][]*lookup // indexed by DNS id
+	slots  chan struct{}         // one per lookup in flight, caps -c
+	retry  chan *lookup
+	wg     sync.WaitGroup
+	result func(ip, server string, resp DNSResponse, err error)
+
+	wheelMu  sync.Mutex
+	wheel    [][]timeoutEntry
+	wheelPos int
+}
+
+func newEngine(cfg *Config, rate int, result func(ip, server string, resp DNSResponse, err error)) (*engine, error) {
+	e := &engine{
+		cfg:    cfg,
+		rate:   rate,
+		slots:  make(chan struct{}, cfg.concurrency),
+		retry:  make(chan *lookup, cfg.concurrency),
+		result: result,
+		wheel:  make([][]timeoutEntry, int(cfg.timeout/wheelTick)+2),
+	}
+	for i := 0; i < numSockets; i++ {
+		conn, err := net.ListenUDP("udp4", nil)
+		if err != nil {
+			return nil, err
+		}
+		conn.SetReadBuffer(16 << 20)
+		conn.SetWriteBuffer(16 << 20)
+		e.conns = append(e.conns, conn)
+		e.pconns = append(e.pconns, ipv4.NewPacketConn(conn))
+		e.table[i] = make([]*lookup, 65536)
+	}
+	return e, nil
+}
+
+// run looks up every IP from jobs and returns once all of them have a result
+func (e *engine) run(jobs <-chan uint32) {
+	for i := range e.conns {
+		go e.receive(i)
+	}
+	stop := make(chan struct{})
+	go e.expire(stop)
+	defer func() {
+		close(stop)
+		for _, conn := range e.conns {
+			conn.Close()
+		}
+	}()
+
+	limit := batchSize
+	var interval time.Duration
+	var nextSend time.Time
+	if e.rate > 0 {
+		interval = time.Second / time.Duration(e.rate)
+		limit = min(batchSize, max(1, e.rate/100))
+	}
+
+	jobsOpen := true
+	allDone := make(chan struct{})
+	closeJobs := func() {
+		jobsOpen = false
+		go func() {
+			e.wg.Wait()
+			close(allDone)
+		}()
+	}
+
+	for {
+		var batch []*lookup
+
+		// block for the first lookup: a retry, or a new IP once a slot is free
+		if jobsOpen {
+			select {
+			case l := <-e.retry:
+				batch = append(batch, l)
+			case e.slots <- struct{}{}:
+				if ip, ok := <-jobs; ok {
+					batch = append(batch, e.newLookup(ip))
+				} else {
+					<-e.slots
+					closeJobs()
+					continue
+				}
+			}
+		} else {
+			select {
+			case l := <-e.retry:
+				batch = append(batch, l)
+			case <-allDone:
+				return
+			}
+		}
+
+		// fill the rest of the batch without blocking
+	fill:
+		for len(batch) < limit {
+			select {
+			case l := <-e.retry:
+				batch = append(batch, l)
+				continue
+			default:
+			}
+			if !jobsOpen {
+				break
+			}
+			select {
+			case e.slots <- struct{}{}:
+			default:
+				break fill
+			}
+			select {
+			case ip, ok := <-jobs:
+				if !ok {
+					<-e.slots
+					closeJobs()
+					break fill
+				}
+				batch = append(batch, e.newLookup(ip))
+			default:
+				<-e.slots
+				break fill
+			}
+		}
+
+		if interval > 0 {
+			// advance the schedule rather than restarting it from now, so sleep overshoot does not add up;
+			// after an idle stretch of over a second, start the schedule again instead of bursting to catch up
+			now := time.Now()
+			if now.Sub(nextSend) > time.Second {
+				nextSend = now
+			}
+			if wait := nextSend.Sub(now); wait > 0 {
+				time.Sleep(wait)
+			}
+			nextSend = nextSend.Add(time.Duration(len(batch)) * interval)
+		}
+		e.send(batch)
+	}
+}
+
+func (e *engine) newLookup(ip uint32) *lookup {
+	e.wg.Add(1)
+	query, qlen := buildQuery(ip)
+	return &lookup{ip: ip, query: query, qlen: qlen}
+}
+
+// send registers each lookup under a free id on a socket and writes them with sendmmsg
+func (e *engine) send(batch []*lookup) {
+	var msgs [numSockets][]ipv4.Message
+	for i, l := range batch {
+		l.res = e.cfg.getNextServer()
+		l.sock = i % numSockets
+
+		e.mu[l.sock].Lock()
+		id := uint16(rand.Uint32())
+		for e.table[l.sock][id] != nil {
+			id = uint16(rand.Uint32())
+		}
+		l.id = id
+		binary.BigEndian.PutUint16(l.query, id)
+		e.table[l.sock][id] = l
+		e.mu[l.sock].Unlock()
+
+		e.addTimeout(l)
+		msgs[l.sock] = append(msgs[l.sock], ipv4.Message{Buffers: [][]byte{l.query}, Addr: l.res.udp})
+	}
+
+	for s := range msgs {
+		for pending := msgs[s]; len(pending) > 0; {
+			n, err := e.pconns[s].WriteBatch(pending, 0)
+			if err != nil {
+				// the lookups in this batch time out and are retried
+				fmt.Fprintf(os.Stderr, "Error sending queries: %v\n", err)
+				break
+			}
+			pending = pending[n:]
+		}
+	}
+}
+
+// receive reads answers with recvmmsg and hands each matched one to handle
+func (e *engine) receive(s int) {
+	msgs := make([]ipv4.Message, batchSize)
+	for i := range msgs {
+		msgs[i].Buffers = [][]byte{make([]byte, 4096)}
+	}
+
+	for {
+		n, err := e.pconns[s].ReadBatch(msgs, 0)
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			continue
+		}
+
+		for i := 0; i < n; i++ {
+			buf := msgs[i].Buffers[0][:msgs[i].N]
+			from, ok := msgs[i].Addr.(*net.UDPAddr)
+			if len(buf) < 12 || !ok {
+				continue
+			}
+			id := binary.BigEndian.Uint16(buf)
+
+			// only accept an answer from the resolver we asked, for the question we asked
+			e.mu[s].Lock()
+			l := e.table[s][id]
+			if l == nil || !l.res.udp.IP.Equal(from.IP) || l.res.udp.Port != from.Port || !bytes.HasPrefix(buf[12:], l.query[12:12+l.qlen]) {
+				e.mu[s].Unlock()
+				continue
+			}
+			e.table[s][id] = nil
+			e.mu[s].Unlock()
+
+			e.handle(l, buf)
+		}
+	}
+}
+
+func (e *engine) handle(l *lookup, buf []byte) {
+	m := new(dns.Msg)
+	if err := m.Unpack(buf); err != nil {
+		l.res.fail()
+		e.retryOrFinish(l, err)
+		return
+	}
+
+	resp, err, final := parseAnswer(m)
+	if !final {
+		l.res.fail()
+		e.retryOrFinish(l, err)
+		return
+	}
+	l.res.ok()
+	e.finish(l, resp, err)
+}
+
+// retryOrFinish queues another attempt on the next resolver, or reports err once -r retries are used up
+func (e *engine) retryOrFinish(l *lookup, err error) {
+	if l.attempt < e.cfg.retries {
+		l.attempt++
+		e.retry <- l
+		return
+	}
+	e.finish(l, DNSResponse{}, err)
+}
+
+func (e *engine) finish(l *lookup, resp DNSResponse, err error) {
+	e.result(ipToString(l.ip), l.res.host, resp, err)
+	<-e.slots
+	e.wg.Done()
+}
+
+func (e *engine) addTimeout(l *lookup) {
+	e.wheelMu.Lock()
+	pos := (e.wheelPos + int(e.cfg.timeout/wheelTick) + 1) % len(e.wheel)
+	e.wheel[pos] = append(e.wheel[pos], timeoutEntry{l, l.sock, l.id, l.attempt})
+	e.wheelMu.Unlock()
+}
+
+// expire advances the timeout wheel every tick and retries lookups that are still waiting on that attempt
+func (e *engine) expire(stop <-chan struct{}) {
+	ticker := time.NewTicker(wheelTick)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+		}
+
+		e.wheelMu.Lock()
+		e.wheelPos = (e.wheelPos + 1) % len(e.wheel)
+		due := e.wheel[e.wheelPos]
+		e.wheel[e.wheelPos] = nil
+		e.wheelMu.Unlock()
+
+		for _, t := range due {
+			e.mu[t.sock].Lock()
+			if e.table[t.sock][t.id] != t.l || t.l.attempt != t.attempt {
+				e.mu[t.sock].Unlock()
+				continue
+			}
+			e.table[t.sock][t.id] = nil
+			e.mu[t.sock].Unlock()
+
+			t.l.res.fail()
+			e.retryOrFinish(t.l, errTimeout)
+		}
+	}
 }
 
 func reverse(ss []string) []string {
@@ -434,72 +741,63 @@ func parseInt(s string) int {
 
 const maxBufferLines = 1000
 
-// worker writes to textView directly (TextView.Write is goroutine-safe); the stats loop redraws every 100ms
-func worker(jobs <-chan string, wg *sync.WaitGroup, cfg *Config, stats *Stats, textView *tview.TextView) {
-	defer wg.Done()
-	for ip := range jobs {
-		timestamp := time.Now()
-		var response DNSResponse
-		var err error
-		var server string
+// handleResult counts and outputs one finished lookup. textView is nil with -j; otherwise lines are
+// written to it directly (TextView.Write is goroutine-safe) and the stats loop redraws every 100ms
+func handleResult(cfg *Config, stats *Stats, textView *tview.TextView, ip, server string, response DNSResponse, err error) {
+	stats.increment()
 
-		response, server, err = lookupWithRetry(ip, cfg)
-		if idx := strings.Index(server, ":"); idx != -1 {
-			server = server[:idx]
-		}
+	if err != nil {
+		stats.incrementFailed()
+		if cfg.debug {
+			errRecord := formatErrorAsHostname(err)
+			record := formatRecord(time.Now(), ip, server, []string{errRecord}, "ERR", "", 0)
+			cfg.stdout.write(record)
+			cfg.output.write(record)
 
-		stats.increment()
-
-		if err != nil {
-			stats.incrementFailed()
-			if cfg.debug {
-				errRecord := formatErrorAsHostname(err)
-				timeStr := time.Now().Format("2006-01-02 15:04:05")
-				line := fmt.Sprintf("[gray]%s [gray]│[-] [purple]%15s[-] [gray]│[-] [aqua]%-15s[-] [gray]│[-] [red] ERR [-] [gray]│[-] [gray]%-6s[-] [gray]│[-] [gray]%s[-]\n",
-					timeStr,
+			if textView != nil {
+				fmt.Fprintf(textView, "[gray]%s [gray]│[-] [purple]%15s[-] [gray]│[-] [aqua]%-15s[-] [gray]│[-] [red] ERR [-] [gray]│[-] [gray]%-6s[-] [gray]│[-] [gray]%s[-]\n",
+					time.Now().Format("2006-01-02 15:04:05"),
 					ip,
 					server,
 					"",
 					errRecord)
-				fmt.Fprint(textView, line)
-
-				// Write to NDJSON if enabled
-				writeNDJSON(cfg, time.Now(), ip, server, []string{errRecord}, "ERR", "", 0)
 			}
-			continue
 		}
-
-		stats.incrementSuccess()
-
-		names := cleanNames(response.Names)
-		if len(names) == 0 {
-			continue
-		}
-
-		writeNDJSON(cfg, timestamp, ip, server, names, response.RecordType, response.Target, response.TTL)
-		ptr := strings.Join(names, ", ")
-
-		timeStr := time.Now().Format("2006-01-02 15:04:05")
-		recordTypeColor := "[blue] PTR [-]"
-		if response.Target != "" {
-			stats.incrementCNAME()
-		}
-		if response.RecordType == "CNAME" {
-			recordTypeColor = "[fuchsia]CNAME[-]"
-		} else if response.Target != "" {
-			ptr = fmt.Sprintf("%s -> %s", strings.ToLower(response.Target), ptr)
-		}
-
-		line := fmt.Sprintf("[gray]%s [gray]│[-] [purple]%15s[-] [gray]│[-] [aqua]%-15s[-] [gray]│[-] %-5s [gray]│[-] %s [gray]│[-] %s\n",
-			timeStr,
-			ip,
-			server,
-			recordTypeColor,
-			colorizeTTL(response.TTL),
-			colorizeIPInPtr(ptr, ip))
-
-		fmt.Fprint(textView, line)
+		return
 	}
+
+	stats.incrementSuccess()
+	if response.Target != "" {
+		stats.incrementCNAME()
+	}
+
+	names := cleanNames(response.Names)
+	if len(names) == 0 {
+		return
+	}
+
+	record := formatRecord(time.Now(), ip, server, names, response.RecordType, response.Target, response.TTL)
+	cfg.stdout.write(record)
+	cfg.output.write(record)
+	if textView == nil {
+		return
+	}
+
+	ptr := strings.Join(names, ", ")
+	recordTypeColor := "[blue] PTR [-]"
+	if response.RecordType == "CNAME" {
+		recordTypeColor = "[fuchsia]CNAME[-]"
+	} else if response.Target != "" {
+		ptr = fmt.Sprintf("%s -> %s", strings.ToLower(response.Target), ptr)
+	}
+
+	fmt.Fprintf(textView, "[gray]%s [gray]│[-] [purple]%15s[-] [gray]│[-] [aqua]%-15s[-] [gray]│[-] %-5s [gray]│[-] %s [gray]│[-] %s\n",
+		time.Now().Format("2006-01-02 15:04:05"),
+		ip,
+		server,
+		recordTypeColor,
+		colorizeTTL(response.TTL),
+		colorizeIPInPtr(ptr, ip))
 }
 
 func parseShardArg(shard string) (int, int, error) {
@@ -556,10 +854,11 @@ func loadExcludes(path string) ([]ipRange, error) {
 		if line = strings.TrimSpace(line); line == "" {
 			continue
 		}
-		if !strings.Contains(line, "/") {
-			line += "/32"
+		cidr := line
+		if !strings.Contains(cidr, "/") {
+			cidr += "/32"
 		}
-		prefix, err := netip.ParsePrefix(line)
+		prefix, err := netip.ParsePrefix(cidr)
 		if err != nil || !prefix.Addr().Is4() {
 			return nil, fmt.Errorf("invalid IPv4 CIDR in exclude file: %q", line)
 		}
@@ -588,19 +887,19 @@ func excluded(ranges []ipRange, ip uint32) bool {
 	return i < len(ranges) && ranges[i].start <= ip
 }
 
-// ipString turns a counter into an IP with the octets reversed (like massdns's ptr.py),
-// so consecutive queries land in different /8s and each /24 is spread across the whole run
-func ipString(i uint64) string {
-	n := uint32(i)
-	return fmt.Sprintf("%d.%d.%d.%d", byte(n), byte(n>>8), byte(n>>16), byte(n>>24))
+// ipToString formats a big-endian IPv4 value
+func ipToString(ip uint32) string {
+	return fmt.Sprintf("%d.%d.%d.%d", byte(ip>>24), byte(ip>>16), byte(ip>>8), byte(ip))
 }
 
-// feed sends every IP of the shard to jobs from the current position, then loops if -l is set
-func feed(jobs chan<- string, cfg *Config, stats *Stats, start, end uint64) {
+// feed sends every IP of the shard to jobs from the current position, then loops if -l is set.
+// The counter is turned into an IP with the octets reversed (like massdns's ptr.py),
+// so consecutive queries land in different /8s and each /24 is spread across the whole run
+func feed(jobs chan<- uint32, cfg *Config, stats *Stats, start, end uint64) {
 	for {
 		for i := atomic.LoadUint64(&stats.next); i < end; i++ {
-			if cfg.excludes == nil || !excluded(cfg.excludes, bits.ReverseBytes32(uint32(i))) {
-				jobs <- ipString(i)
+			if ip := bits.ReverseBytes32(uint32(i)); cfg.excludes == nil || !excluded(cfg.excludes, ip) {
+				jobs <- ip
 			}
 			atomic.StoreUint64(&stats.next, i+1)
 		}
@@ -660,8 +959,13 @@ func (c *Config) refreshDNSServers() {
 			fmt.Fprintf(os.Stderr, "Failed to update DNS servers: %v\n", err)
 			continue
 		}
+		parsed, err := newResolvers(resolvers)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to update DNS servers: %v\n", err)
+			continue
+		}
 		c.mu.Lock()
-		c.dnsServers = newResolvers(resolvers)
+		c.dnsServers = parsed
 		c.serverIndex = 0
 		c.mu.Unlock()
 	}
@@ -679,6 +983,7 @@ func main() {
 	jsonOutput := flag.Bool("j", false, "Output NDJSON to stdout (no TUI)")
 	statePath := flag.String("state", "", "State file to resume from and save progress to")
 	excludePath := flag.String("exclude", "", "File of IPv4 CIDRs or IPs to skip (one per line)")
+	rate := flag.Int("rate", 0, "Max queries per second (0 for unlimited)")
 	flag.Parse()
 
 	shardNum, totalShards, err := parseShardArg(*shard)
@@ -693,12 +998,24 @@ func main() {
 		os.Exit(1)
 	}
 
+	// each socket has 65536 DNS ids, keep well under that so a free id is always found quickly
+	if *concurrency < 1 || *concurrency > numSockets*32768 {
+		fmt.Fprintf(os.Stderr, "Concurrency must be between 1 and %d\n", numSockets*32768)
+		os.Exit(1)
+	}
+
+	resolvers, err := newResolvers(servers)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading DNS servers: %v\n", err)
+		os.Exit(1)
+	}
+
 	cfg := &Config{
 		concurrency: *concurrency,
 		timeout:     *timeout,
 		retries:     *retries,
 		debug:       *debug,
-		dnsServers:  newResolvers(servers),
+		dnsServers:  resolvers,
 		loop:        *loop,
 	}
 
@@ -797,50 +1114,18 @@ func main() {
 		os.Exit(1)
 	}()
 
+	jobs := make(chan uint32, cfg.concurrency)
+	go feed(jobs, cfg, stats, shardStart, shardEnd)
+
 	if *jsonOutput {
-		// JSON-only mode
-		jobs := make(chan string, cfg.concurrency)
-		var wg sync.WaitGroup
-
-		// Start workers
-		for i := 0; i < cfg.concurrency; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for ip := range jobs {
-					var response DNSResponse
-					var err error
-					var server string
-
-					response, server, err = lookupWithRetry(ip, cfg)
-					if idx := strings.Index(server, ":"); idx != -1 {
-						server = server[:idx]
-					}
-
-					if err != nil {
-						if cfg.debug {
-							line := formatRecord(time.Now(), ip, server, []string{formatErrorAsHostname(err)}, "ERR", "", 0)
-							cfg.stdout.write(line)
-							cfg.output.write(line)
-						}
-						continue
-					}
-
-					names := cleanNames(response.Names)
-					if len(names) == 0 {
-						continue
-					}
-
-					line := formatRecord(time.Now(), ip, server, names, response.RecordType, response.Target, response.TTL)
-					cfg.stdout.write(line)
-					cfg.output.write(line)
-				}
-			}()
+		eng, err := newEngine(cfg, *rate, func(ip, server string, resp DNSResponse, err error) {
+			handleResult(cfg, stats, nil, ip, server, resp, err)
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error opening sockets: %v\n", err)
+			os.Exit(1)
 		}
-
-		// Feed IPs to workers
-		feed(jobs, cfg, stats, shardStart, shardEnd)
-		wg.Wait()
+		eng.run(jobs)
 		return
 	}
 
@@ -928,18 +1213,15 @@ func main() {
 		}
 	}()
 
-	jobs := make(chan string, cfg.concurrency)
-
-	go feed(jobs, cfg, stats, shardStart, shardEnd)
-
-	var wg sync.WaitGroup
-	for i := 0; i < cfg.concurrency; i++ {
-		wg.Add(1)
-		go worker(jobs, &wg, cfg, stats, textView)
+	eng, err := newEngine(cfg, *rate, func(ip, server string, resp DNSResponse, err error) {
+		handleResult(cfg, stats, textView, ip, server, resp, err)
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error opening sockets: %v\n", err)
+		os.Exit(1)
 	}
-
 	go func() {
-		wg.Wait()
+		eng.run(jobs)
 		app.Stop()
 	}()
 
@@ -1017,10 +1299,6 @@ func formatRecord(timestamp time.Time, ip, server string, records []string, reco
 
 	data, _ := json.Marshal(record)
 	return string(data)
-}
-
-func writeNDJSON(cfg *Config, timestamp time.Time, ip, server string, records []string, recordType, target string, ttl uint32) {
-	cfg.output.write(formatRecord(timestamp, ip, server, records, recordType, target, ttl))
 }
 
 // lineWriter is a buffered, goroutine-safe line writer; nil means disabled
