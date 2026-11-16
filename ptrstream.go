@@ -2,16 +2,22 @@ package main
 
 import (
 	"bufio"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math/bits"
 	"net/http"
+	"net/netip"
 	"os"
+	"os/signal"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/miekg/dns"
@@ -30,6 +36,7 @@ type Config struct {
 	outputFile  *os.File
 	mu          sync.Mutex
 	loop        bool
+	excludes    []ipRange
 }
 
 type Stats struct {
@@ -43,7 +50,8 @@ type Stats struct {
 	cnames        uint64
 	speedHistory  []float64
 	mu            sync.Mutex
-	round         uint64
+	round         uint64 // 0-based, shown as round+1
+	next          uint64 // next counter value to dispatch
 }
 
 func (s *Stats) increment() {
@@ -471,19 +479,120 @@ func shardRange(shardNum, totalShards int) (uint64, uint64) {
 	return start, end
 }
 
-// ipStream yields every IP of the shard once, counting with the octets reversed (like massdns's ptr.py)
-// so consecutive queries land in different /8s and each /24 is spread across the whole run
-func ipStream(shardNum, totalShards int) <-chan string {
-	out := make(chan string, 1000)
-	go func() {
-		defer close(out)
-		start, end := shardRange(shardNum, totalShards)
-		for i := start; i < end; i++ {
-			n := uint32(i)
-			out <- fmt.Sprintf("%d.%d.%d.%d", byte(n), byte(n>>8), byte(n>>16), byte(n>>24))
+// ipRange is an inclusive range of IPv4 addresses
+type ipRange struct {
+	start, end uint32
+}
+
+// loadExcludes reads CIDRs or single IPs (one per line, # comments) into sorted, merged ranges
+func loadExcludes(path string) ([]ipRange, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open exclude file: %v", err)
+	}
+	defer file.Close()
+
+	var ranges []ipRange
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line, _, _ := strings.Cut(scanner.Text(), "#")
+		if line = strings.TrimSpace(line); line == "" {
+			continue
 		}
-	}()
-	return out
+		if !strings.Contains(line, "/") {
+			line += "/32"
+		}
+		prefix, err := netip.ParsePrefix(line)
+		if err != nil || !prefix.Addr().Is4() {
+			return nil, fmt.Errorf("invalid IPv4 CIDR in exclude file: %q", line)
+		}
+		start := binary.BigEndian.Uint32(prefix.Masked().Addr().AsSlice())
+		ranges = append(ranges, ipRange{start, start | uint32(1<<(32-prefix.Bits())-1)})
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading exclude file: %v", err)
+	}
+
+	sort.Slice(ranges, func(i, j int) bool { return ranges[i].start < ranges[j].start })
+	var merged []ipRange
+	for _, r := range ranges {
+		if n := len(merged); n > 0 && uint64(r.start) <= uint64(merged[n-1].end)+1 {
+			merged[n-1].end = max(merged[n-1].end, r.end)
+		} else {
+			merged = append(merged, r)
+		}
+	}
+	return merged, nil
+}
+
+// excluded reports whether ip falls in one of the sorted, merged ranges
+func excluded(ranges []ipRange, ip uint32) bool {
+	i := sort.Search(len(ranges), func(i int) bool { return ranges[i].end >= ip })
+	return i < len(ranges) && ranges[i].start <= ip
+}
+
+// ipString turns a counter into an IP with the octets reversed (like massdns's ptr.py),
+// so consecutive queries land in different /8s and each /24 is spread across the whole run
+func ipString(i uint64) string {
+	n := uint32(i)
+	return fmt.Sprintf("%d.%d.%d.%d", byte(n), byte(n>>8), byte(n>>16), byte(n>>24))
+}
+
+// feed sends every IP of the shard to jobs from the current position, then loops if -l is set
+func feed(jobs chan<- string, cfg *Config, stats *Stats, start, end uint64) {
+	for {
+		for i := atomic.LoadUint64(&stats.next); i < end; i++ {
+			if cfg.excludes == nil || !excluded(cfg.excludes, bits.ReverseBytes32(uint32(i))) {
+				jobs <- ipString(i)
+			}
+			atomic.StoreUint64(&stats.next, i+1)
+		}
+
+		if !cfg.loop {
+			break
+		}
+		atomic.AddUint64(&stats.round, 1)
+		atomic.StoreUint64(&stats.next, start)
+	}
+	close(jobs)
+}
+
+// loadState returns the saved round and position, rewound by rewind IPs to cover lookups still in flight
+func loadState(path, shard string, start, end, rewind uint64) (uint64, uint64, error) {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return 0, start, nil
+	} else if err != nil {
+		return 0, 0, err
+	}
+
+	var savedShard string
+	var round, next uint64
+	if _, err := fmt.Sscanf(string(data), "shard=%s round=%d next=%d", &savedShard, &round, &next); err != nil {
+		return 0, 0, fmt.Errorf("invalid state file %s: %v", path, err)
+	}
+	if savedShard != shard {
+		return 0, 0, fmt.Errorf("state file %s is for shard %s, not %s", path, savedShard, shard)
+	}
+	if round < 1 || next < start || next > end {
+		return 0, 0, fmt.Errorf("state file %s is out of range for shard %s", path, shard)
+	}
+
+	if next-start > rewind {
+		next -= rewind
+	} else {
+		next = start
+	}
+	return round - 1, next, nil
+}
+
+// saveState writes the round and position to path through a temporary file so it is never left half written
+func saveState(path, shard string, stats *Stats) error {
+	line := fmt.Sprintf("shard=%s round=%d next=%d\n", shard, atomic.LoadUint64(&stats.round)+1, atomic.LoadUint64(&stats.next))
+	if err := os.WriteFile(path+".tmp", []byte(line), 0644); err != nil {
+		return err
+	}
+	return os.Rename(path+".tmp", path)
 }
 
 // refreshDNSServers re-fetches the default resolver list every 24 hours (only used without -dns)
@@ -511,6 +620,8 @@ func main() {
 	shard := flag.String("shard", "", "Shard specification (e.g., 1/4 for first shard of 4)")
 	loop := flag.Bool("l", false, "Loop continuously after completion")
 	jsonOutput := flag.Bool("j", false, "Output NDJSON to stdout (no TUI)")
+	statePath := flag.String("state", "", "State file to resume from and save progress to")
+	excludePath := flag.String("exclude", "", "File of IPv4 CIDRs or IPs to skip (one per line)")
 	flag.Parse()
 
 	shardNum, totalShards, err := parseShardArg(*shard)
@@ -536,6 +647,13 @@ func main() {
 
 	if *dnsFile == "" {
 		go cfg.refreshDNSServers()
+	}
+
+	if *excludePath != "" {
+		if cfg.excludes, err = loadExcludes(*excludePath); err != nil {
+			fmt.Printf("Error loading excludes: %v\n", err)
+			return
+		}
 	}
 
 	if *outputPath != "" {
@@ -574,6 +692,36 @@ func main() {
 		total:         shardEnd - shardStart,
 		lastCheckTime: time.Now(),
 		startTime:     time.Now(),
+		next:          shardStart,
+	}
+
+	if *statePath != "" {
+		shardSpec := fmt.Sprintf("%d/%d", shardNum, totalShards)
+		// in flight at most: the jobs queue plus one lookup per worker
+		stats.round, stats.next, err = loadState(*statePath, shardSpec, shardStart, shardEnd, uint64(2*cfg.concurrency))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error loading state: %v\n", err)
+			return
+		}
+		go func() {
+			for range time.Tick(10 * time.Second) {
+				if err := saveState(*statePath, shardSpec, stats); err != nil {
+					fmt.Fprintf(os.Stderr, "Error saving state: %v\n", err)
+				}
+			}
+		}()
+		defer saveState(*statePath, shardSpec, stats)
+
+		// save on SIGINT/SIGTERM too (systemd stop), lookups in flight are covered by the rewind on load
+		sigs := make(chan os.Signal, 1)
+		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			<-sigs
+			if err := saveState(*statePath, shardSpec, stats); err != nil {
+				fmt.Fprintf(os.Stderr, "Error saving state: %v\n", err)
+			}
+			os.Exit(1)
+		}()
 	}
 
 	go func() {
@@ -607,7 +755,7 @@ func main() {
 				stats.lastCheckTime = now
 				stats.mu.Unlock()
 
-				percent := float64(processed) / float64(stats.total) * 100
+				percent := float64(atomic.LoadUint64(&stats.next)-shardStart) / float64(stats.total) * 100
 
 				app.QueueUpdateDraw(func() {
 					var width int
@@ -679,14 +827,18 @@ func main() {
 
 					if err != nil {
 						if cfg.debug {
-							fmt.Println(formatRecord(time.Now(), ip, server, []string{formatErrorAsHostname(err)}, "ERR", "", 0))
+							line := formatRecord(time.Now(), ip, server, []string{formatErrorAsHostname(err)}, "ERR", "", 0)
+							fmt.Println(line)
+							writeLine(cfg, line)
 						}
 						continue
 					}
 
 					if len(response.Names) == 0 {
 						if cfg.debug {
-							fmt.Println(formatRecord(time.Now(), ip, server, []string{"FAIL.NO-PTR-RECORD.in-addr.arpa"}, "ERR", "", 0))
+							line := formatRecord(time.Now(), ip, server, []string{"FAIL.NO-PTR-RECORD.in-addr.arpa"}, "ERR", "", 0)
+							fmt.Println(line)
+							writeLine(cfg, line)
 						}
 						continue
 					}
@@ -696,40 +848,22 @@ func main() {
 						continue
 					}
 
-					fmt.Println(formatRecord(time.Now(), ip, server, names, response.RecordType, response.Target, response.TTL))
+					line := formatRecord(time.Now(), ip, server, names, response.RecordType, response.Target, response.TTL)
+					fmt.Println(line)
+					writeLine(cfg, line)
 				}
 			}()
 		}
 
 		// Feed IPs to workers
-		for {
-			for ip := range ipStream(shardNum, totalShards) {
-				jobs <- ip
-			}
-
-			if !cfg.loop {
-				break
-			}
-		}
-		close(jobs)
+		feed(jobs, cfg, stats, shardStart, shardEnd)
 		wg.Wait()
 		return
 	}
 
 	jobs := make(chan string, cfg.concurrency)
 
-	go func() {
-		for {
-			for ip := range ipStream(shardNum, totalShards) {
-				jobs <- ip
-			}
-
-			if !cfg.loop {
-				break
-			}
-		}
-		close(jobs)
-	}()
+	go feed(jobs, cfg, stats, shardStart, shardEnd)
 
 	var wg sync.WaitGroup
 	for i := 0; i < cfg.concurrency; i++ {
@@ -820,13 +954,17 @@ func formatRecord(timestamp time.Time, ip, server string, records []string, reco
 }
 
 func writeNDJSON(cfg *Config, timestamp time.Time, ip, server string, records []string, recordType, target string, ttl uint32) {
+	writeLine(cfg, formatRecord(timestamp, ip, server, records, recordType, target, ttl))
+}
+
+// writeLine appends one NDJSON line to the -o file, if set
+func writeLine(cfg *Config, line string) {
 	if cfg.outputFile == nil {
 		return
 	}
 
-	line := formatRecord(timestamp, ip, server, records, recordType, target, ttl) + "\n"
 	cfg.mu.Lock()
-	cfg.outputFile.WriteString(line)
+	cfg.outputFile.WriteString(line + "\n")
 	cfg.mu.Unlock()
 }
 
