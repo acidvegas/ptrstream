@@ -15,7 +15,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/acidvegas/golcg"
 	"github.com/miekg/dns"
 	"github.com/rivo/tview"
 )
@@ -479,6 +478,28 @@ func parseShardArg(shard string) (int, int, error) {
 	return shardNum, totalShards, nil
 }
 
+// shardRange returns the [start, end) counter range for a shard of the 2^32 IPv4 space
+func shardRange(shardNum, totalShards int) (uint64, uint64) {
+	start := uint64(shardNum-1) * (1 << 32) / uint64(totalShards)
+	end := uint64(shardNum) * (1 << 32) / uint64(totalShards)
+	return start, end
+}
+
+// ipStream yields every IP of the shard once, counting with the octets reversed (like massdns's ptr.py)
+// so consecutive queries land in different /8s and each /24 is spread across the whole run
+func ipStream(shardNum, totalShards int) <-chan string {
+	out := make(chan string, 1000)
+	go func() {
+		defer close(out)
+		start, end := shardRange(shardNum, totalShards)
+		for i := start; i < end; i++ {
+			n := uint32(i)
+			out <- fmt.Sprintf("%d.%d.%d.%d", byte(n), byte(n>>8), byte(n>>16), byte(n>>24))
+		}
+	}()
+	return out
+}
+
 func (c *Config) updateDNSServers() error {
 	c.updateMu.Lock()
 	defer c.updateMu.Unlock()
@@ -518,7 +539,6 @@ func main() {
 	dnsFile := flag.String("dns", "", "File containing DNS servers (one per line)")
 	debug := flag.Bool("debug", false, "Show unsuccessful lookups")
 	outputPath := flag.String("o", "", "Path to NDJSON output file")
-	seed := flag.Int64("s", 0, "Seed for IP generation (0 for random)")
 	shard := flag.String("shard", "", "Shard specification (e.g., 1/4 for first shard of 4)")
 	loop := flag.Bool("l", false, "Loop continuously after completion")
 	jsonOutput := flag.Bool("j", false, "Output NDJSON to stdout (no TUI)")
@@ -528,10 +548,6 @@ func main() {
 	if err != nil {
 		fmt.Printf("Error parsing shard argument: %v\n", err)
 		return
-	}
-
-	if *seed == 0 {
-		*seed = time.Now().UnixNano()
 	}
 
 	servers, err := loadDNSServers(*dnsFile)
@@ -586,8 +602,10 @@ func main() {
 		AddItem(textView, 0, 1, false).
 		AddItem(progress, 4, 0, false)
 
+	shardStart, shardEnd := shardRange(shardNum, totalShards)
+
 	stats := &Stats{
-		total:         1 << 32,
+		total:         shardEnd - shardStart,
 		lastCheckTime: time.Now(),
 		startTime:     time.Now(),
 	}
@@ -790,13 +808,7 @@ func main() {
 
 		// Feed IPs to workers
 		for {
-			stream, err := golcg.IPStream("0.0.0.0/0", shardNum, totalShards, int(*seed), nil)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error creating IP stream: %v\n", err)
-				return
-			}
-
-			for ip := range stream {
+			for ip := range ipStream(shardNum, totalShards) {
 				jobs <- ip
 			}
 
@@ -813,13 +825,7 @@ func main() {
 
 	go func() {
 		for {
-			stream, err := golcg.IPStream("0.0.0.0/0", shardNum, totalShards, int(*seed), nil)
-			if err != nil {
-				fmt.Printf("Error creating IP stream: %v\n", err)
-				return
-			}
-
-			for ip := range stream {
+			for ip := range ipStream(shardNum, totalShards) {
 				jobs <- ip
 			}
 

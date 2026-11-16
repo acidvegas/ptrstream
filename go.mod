@@ -3,7 +3,6 @@ module github.com/acidvegas/ptrstream
 go 1.23.3
 
 require (
-	github.com/acidvegas/golcg v1.0.1
 	github.com/miekg/dns v1.1.62
 	github.com/rivo/tview v0.0.0-20241103174730-c76f7879f592
 )
