@@ -57,9 +57,8 @@ type Stats struct {
 	startTime     time.Time
 	success       uint64
 	failed        uint64
-	cnameOnly     uint64 // answers that were only a CNAME, no PTR behind it
-	viaCNAME      uint64 // PTRs reached through an RFC 2317 CNAME
-	timeouts      uint64
+	cnameOnly     uint64              // answers that were only a CNAME, no PTR behind it
+	viaCNAME      uint64              // PTRs reached through an RFC 2317 CNAME
 	outcomes      [numOutcomes]uint64 // final result of each failed lookup, for the stats line
 	speedHistory  []float64
 	mu            sync.Mutex
@@ -813,6 +812,22 @@ func parseInt(s string) int {
 
 const maxBufferLines = 1000
 
+// recordPrefix is the visible width of a TUI result line before the record (ip, resolver, type, ttl and separators)
+const recordPrefix = 54
+
+// panelWidth is the inner width of the TUI panels, set by the draw loop so long records can be cut to fit
+var panelWidth atomic.Int64
+
+// fitRecord cuts a record to the room left on a TUI line, ending it with an ellipsis, so lines never wrap
+func fitRecord(record string) string {
+	room := int(panelWidth.Load()) - recordPrefix
+	runes := []rune(record)
+	if room < 1 || len(runes) <= room {
+		return record
+	}
+	return string(runes[:room-1]) + "…"
+}
+
 // handleResult counts and outputs one finished lookup. textView is nil with -j; otherwise lines are
 // written to it directly (TextView.Write is goroutine-safe) and the stats loop redraws every 100ms
 func handleResult(cfg *Config, stats *Stats, textView *tview.TextView, ip, server string, response DNSResponse, err error) {
@@ -821,9 +836,6 @@ func handleResult(cfg *Config, stats *Stats, textView *tview.TextView, ip, serve
 	if err != nil {
 		stats.incrementFailed()
 		atomic.AddUint64(&stats.outcomes[outcome(err)], 1)
-		if errors.Is(err, errTimeout) {
-			atomic.AddUint64(&stats.timeouts, 1)
-		}
 		if cfg.debug {
 			errRecord := formatErrorAsHostname(err)
 			record := formatRecord(time.Now(), ip, server, []string{errRecord}, "ERR", "", 0)
@@ -831,8 +843,7 @@ func handleResult(cfg *Config, stats *Stats, textView *tview.TextView, ip, serve
 			cfg.output.write(record)
 
 			if textView != nil {
-				fmt.Fprintf(textView, "[gray]%s [gray]│[-] [purple]%15s[-] [gray]│[-] [aqua]%-15s[-] [gray]│[-] [red] ERR [-] [gray]│[-] [gray]%-6s[-] [gray]│[-] [gray]%s[-]\n",
-					time.Now().Format("2006-01-02 15:04:05"),
+				fmt.Fprintf(textView, "[purple]%15s[-] [gray]│[-] [aqua]%-15s[-] [gray]│[-] [red] ERR [-] [gray]│[-] [gray]%-7s[-] [gray]│[-] [gray]%s[-]\n",
 					ip,
 					server,
 					"",
@@ -869,13 +880,12 @@ func handleResult(cfg *Config, stats *Stats, textView *tview.TextView, ip, serve
 		ptr = fmt.Sprintf("%s -> %s", strings.ToLower(response.Target), ptr)
 	}
 
-	fmt.Fprintf(textView, "[gray]%s [gray]│[-] [purple]%15s[-] [gray]│[-] [aqua]%-15s[-] [gray]│[-] %-5s [gray]│[-] %s [gray]│[-] %s\n",
-		time.Now().Format("2006-01-02 15:04:05"),
+	fmt.Fprintf(textView, "[purple]%15s[-] [gray]│[-] [aqua]%-15s[-] [gray]│[-] %-5s [gray]│[-] %s [gray]│[-] %s\n",
 		ip,
 		server,
 		recordTypeColor,
 		colorizeTTL(response.TTL),
-		colorizeIPInPtr(ptr, ip))
+		colorizeIPInPtr(fitRecord(ptr), ip))
 }
 
 // finishResult outputs a finished lookup, then marks it done for resume
@@ -1204,7 +1214,8 @@ func main() {
 	textView := tview.NewTextView().
 		SetDynamicColors(true).
 		SetScrollable(true).
-		SetMaxLines(maxBufferLines)
+		SetMaxLines(maxBufferLines).
+		SetWrap(false)
 	textView.ScrollToEnd()
 	textView.SetBorder(true).SetTitle(" PTR Records ")
 
@@ -1216,7 +1227,7 @@ func main() {
 	flex := tview.NewFlex().
 		SetDirection(tview.FlexRow).
 		AddItem(textView, 0, 1, false).
-		AddItem(progress, 4, 0, false)
+		AddItem(progress, 5, 0, false)
 
 	shardStart, shardEnd := shardRange(shardNum, totalShards)
 
@@ -1319,9 +1330,10 @@ func main() {
 					if width <= 0 {
 						return
 					}
+					panelWidth.Store(int64(width))
 
-					// First line: stats
-					statsLine := fmt.Sprintf(" [aqua]Elapsed:[:-] [white]%s [gray]│[-] [aqua]Round:[:-] [white]%d [gray]│[-] [aqua]Count:[:-] [white]%s [gray]│[-] [aqua]Progress:[:-] [darkgray]%.2f%%[-] [gray]│[-] [aqua]Rate:[:-] %s [gray]│[-] [aqua]CNAME only:[:-] [yellow]%s[-] [gray]│[-] [aqua]Via CNAME:[:-] [yellow]%s[-] [gray]│[-] [aqua]Successful:[:-] [green]✓ %s[-][darkgray] (%.1f%%)[-] [gray]│[-] [aqua]Failed:[:-] [red]✗ %s[-][darkgray] (%.1f%%)[-] [gray]│[-] [aqua]Resolvers:[:-] [white]%d/%d[-]\n",
+					// First two lines: stats, split so they fit a ~125 column terminal even with billions counted
+					statsLine := fmt.Sprintf(" [aqua]Elapsed:[:-] [white]%s [gray]│[-] [aqua]Round:[:-] [white]%d [gray]│[-] [aqua]Count:[:-] [white]%s [gray]│[-] [aqua]Progress:[:-] [darkgray]%.2f%%[-] [gray]│[-] [aqua]Rate:[:-] %s\n [aqua]CNAME only:[:-] [yellow]%s[-] [gray]│[-] [aqua]Via CNAME:[:-] [yellow]%s[-] [gray]│[-] [aqua]Successful:[:-] [green]✓ %s[-][darkgray] (%.1f%%)[-] [gray]│[-] [aqua]Failed:[:-] [red]✗ %s[-][darkgray] (%.1f%%)[-] [gray]│[-] [aqua]Resolvers:[:-] [white]%d/%d[-]\n",
 						formatDuration(time.Since(stats.startTime)),
 						atomic.LoadUint64(&stats.round)+1,
 						formatNumber(processed),
@@ -1335,7 +1347,7 @@ func main() {
 						float64(failed)/float64(processed)*100,
 						active, totalResolvers)
 
-					// Second line: progress bar
+					// Third line: progress bar
 					barWidth := width - 3 // -3 for the [] and space
 					if barWidth < 1 {
 						progress.Clear()
@@ -1571,15 +1583,15 @@ func formatDuration(d time.Duration) string {
 func colorizeTTL(ttl uint32) string {
 	switch {
 	case ttl >= 86400: // 1 day or more
-		return fmt.Sprintf("[#00FF00::b]%-6d[-]", ttl) // Bright green with bold
+		return fmt.Sprintf("[#00FF00::b]%-7d[-]", ttl) // Bright green with bold
 	case ttl >= 3600: // 1 hour or more
-		return fmt.Sprintf("[yellow]%-6d[-]", ttl)
+		return fmt.Sprintf("[yellow]%-7d[-]", ttl)
 	case ttl >= 300: // 5 minutes or more
-		return fmt.Sprintf("[orange]%-6d[-]", ttl)
+		return fmt.Sprintf("[orange]%-7d[-]", ttl)
 	case ttl >= 60: // 1 minute or more
-		return fmt.Sprintf("[red]%-6d[-]", ttl)
+		return fmt.Sprintf("[red]%-7d[-]", ttl)
 	default: // Less than 60 seconds
-		return fmt.Sprintf("[gray]%-6d[-]", ttl)
+		return fmt.Sprintf("[gray]%-7d[-]", ttl)
 	}
 }
 
