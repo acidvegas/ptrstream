@@ -206,11 +206,3 @@ In the NDJSON they look like this:
 ```json
 {"@timestamp":"2024-01-05T12:34:56Z","ip":"1.2.3.4","nameserver":"8.8.8.8","record":["FAIL.TIMEOUT.in-addr.arpa"],"record_type":"ERR","ttl":0}
 ```
-
-___
-
-###### Mirrors: [acid.vegas](https://git.acid.vegas/ptrstream) • [SuperNETs](https://git.supernets.org/acidvegas/ptrstream) • [GitHub](https://github.com/acidvegas/ptrstream) • [GitLab](https://gitlab.com/acidvegas/ptrstream) • [Codeberg](https://codeberg.org/acidvegas/ptrstream)
-
----
-
-###### Mirrors: [SuperNETs](https://git.supernets.org/acidvegas/) • [GitHub](https://github.com/acidvegas/) • [GitLab](https://gitlab.com/acidvegas/) • [Codeberg](https://codeberg.org/acidvegas/)
