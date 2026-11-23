@@ -4,7 +4,10 @@ ptrstream.exe
 
 # Output files
 *.json
+*.ndjson
 *.txt
+*.state
+*.state.tmp
 
 # Go specific
 *.test
