@@ -45,6 +45,8 @@ type Config struct {
 	mu          sync.Mutex
 	loop        bool
 	excludes    []ipRange
+	queries     uint64 // queries sent, retries included
+	retried     uint64 // queries that were retries
 }
 
 type Stats struct {
@@ -55,7 +57,10 @@ type Stats struct {
 	startTime     time.Time
 	success       uint64
 	failed        uint64
-	cnames        uint64
+	cnameOnly     uint64 // answers that were only a CNAME, no PTR behind it
+	viaCNAME      uint64 // PTRs reached through an RFC 2317 CNAME
+	timeouts      uint64
+	outcomes      [numOutcomes]uint64 // final result of each failed lookup, for the stats line
 	speedHistory  []float64
 	mu            sync.Mutex
 	round         uint64 // 0-based, shown as round+1
@@ -75,12 +80,16 @@ func (s *Stats) incrementFailed() {
 	atomic.AddUint64(&s.failed, 1)
 }
 
-func (s *Stats) incrementCNAME() {
-	atomic.AddUint64(&s.cnames, 1)
+func (s *Stats) countCNAME(recordType string) {
+	if recordType == "CNAME" {
+		atomic.AddUint64(&s.cnameOnly, 1)
+	} else {
+		atomic.AddUint64(&s.viaCNAME, 1)
+	}
 }
 
 const (
-	benchAfter = 5                // consecutive failures before a resolver is benched
+	benchAfter = 20               // consecutive failures before a resolver is benched (reverse DNS fails often on good resolvers, 5 benched most of them)
 	benchFor   = 10 * time.Minute // how long a benched resolver is skipped
 )
 
@@ -266,6 +275,36 @@ func translateRcode(rcode int) string {
 
 var errTimeout = errors.New("i/o timeout")
 
+// outcomes of a failed lookup, counted for the stats line
+const (
+	outNXDomain = iota
+	outServFail
+	outRefused
+	outNoPTR
+	outTimeout
+	outOther
+	numOutcomes
+)
+
+var outcomeNames = [numOutcomes]string{"nxdomain", "servfail", "refused", "noptr", "timeout", "other"}
+
+// outcome sorts a lookup's final error into one of the stats line buckets
+func outcome(err error) int {
+	switch {
+	case errors.Is(err, errTimeout):
+		return outTimeout
+	case err.Error() == translateRcode(dns.RcodeNameError):
+		return outNXDomain
+	case err.Error() == translateRcode(dns.RcodeServerFailure):
+		return outServFail
+	case err.Error() == translateRcode(dns.RcodeRefused):
+		return outRefused
+	case err.Error() == "no PTR records found":
+		return outNoPTR
+	}
+	return outOther
+}
+
 // parseAnswer interprets a response; final is false for errors worth retrying on another resolver
 func parseAnswer(r *dns.Msg) (resp DNSResponse, err error, final bool) {
 	// NXDOMAIN is a final answer, other error codes are retried on the next server
@@ -296,7 +335,7 @@ func parseAnswer(r *dns.Msg) (resp DNSResponse, err error, final bool) {
 		return DNSResponse{Names: names, RecordType: "PTR", Target: target, TTL: ptrTTL}, nil, true
 	}
 	if target != "" {
-		return DNSResponse{Names: []string{target}, RecordType: "CNAME", Target: target, TTL: cnameTTL}, nil, true
+		return DNSResponse{RecordType: "CNAME", Target: target, TTL: cnameTTL}, nil, true
 	}
 	// NOERROR without a PTR or CNAME is a final answer too
 	return DNSResponse{}, fmt.Errorf("no PTR records found"), true
@@ -504,6 +543,7 @@ func (e *engine) newLookup(j job) *lookup {
 
 // send registers each lookup under a free id on a socket and writes them with sendmmsg
 func (e *engine) send(batch []*lookup) {
+	atomic.AddUint64(&e.cfg.queries, uint64(len(batch)))
 	var msgs [numSockets][]ipv4.Message
 	for i, l := range batch {
 		l.res = e.cfg.getNextServer()
@@ -549,6 +589,8 @@ func (e *engine) receive(s int) {
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
+			// a read error that keeps happening would otherwise spin a CPU; the lookups waiting time out and retry
+			time.Sleep(10 * time.Millisecond)
 			continue
 		}
 
@@ -623,6 +665,7 @@ func (e *engine) tcpLookup(l *lookup) {
 func (e *engine) retryOrFinish(l *lookup, err error) {
 	if l.attempt < e.cfg.retries {
 		l.attempt++
+		atomic.AddUint64(&e.cfg.retried, 1)
 		e.retry <- l
 		return
 	}
@@ -777,6 +820,10 @@ func handleResult(cfg *Config, stats *Stats, textView *tview.TextView, ip, serve
 
 	if err != nil {
 		stats.incrementFailed()
+		atomic.AddUint64(&stats.outcomes[outcome(err)], 1)
+		if errors.Is(err, errTimeout) {
+			atomic.AddUint64(&stats.timeouts, 1)
+		}
 		if cfg.debug {
 			errRecord := formatErrorAsHostname(err)
 			record := formatRecord(time.Now(), ip, server, []string{errRecord}, "ERR", "", 0)
@@ -797,11 +844,12 @@ func handleResult(cfg *Config, stats *Stats, textView *tview.TextView, ip, serve
 
 	stats.incrementSuccess()
 	if response.Target != "" {
-		stats.incrementCNAME()
+		stats.countCNAME(response.RecordType)
 	}
 
+	// a CNAME with no PTR behind it has no names (record is left out), its target goes in cname
 	names := cleanNames(response.Names)
-	if len(names) == 0 {
+	if len(names) == 0 && response.RecordType != "CNAME" {
 		return
 	}
 
@@ -816,6 +864,7 @@ func handleResult(cfg *Config, stats *Stats, textView *tview.TextView, ip, serve
 	recordTypeColor := "[blue] PTR [-]"
 	if response.RecordType == "CNAME" {
 		recordTypeColor = "[fuchsia]CNAME[-]"
+		ptr = strings.ToLower(response.Target)
 	} else if response.Target != "" {
 		ptr = fmt.Sprintf("%s -> %s", strings.ToLower(response.Target), ptr)
 	}
@@ -827,6 +876,12 @@ func handleResult(cfg *Config, stats *Stats, textView *tview.TextView, ip, serve
 		recordTypeColor,
 		colorizeTTL(response.TTL),
 		colorizeIPInPtr(ptr, ip))
+}
+
+// finishResult outputs a finished lookup, then marks it done for resume
+func finishResult(cfg *Config, stats *Stats, textView *tview.TextView, j job, server string, resp DNSResponse, err error) {
+	handleResult(cfg, stats, textView, ipToString(j.ip), server, resp, err)
+	stats.track.done(j.round, uint64(bits.ReverseBytes32(j.ip)))
 }
 
 func parseShardArg(shard string) (int, int, error) {
@@ -1018,6 +1073,11 @@ func loadState(path, shard string, start, end uint64) (uint64, uint64, error) {
 		return 0, 0, fmt.Errorf("state file %s is out of range for shard %s", path, shard)
 	}
 
+	// a finished round starts the next one from the beginning, instead of scanning nothing and exiting
+	if next == end {
+		return round, start, nil
+	}
+
 	return round - 1, next, nil
 }
 
@@ -1069,6 +1129,7 @@ func main() {
 	statePath := flag.String("state", "", "State file to resume from and save progress to")
 	excludePath := flag.String("exclude", "", "File of IPv4 CIDRs or IPs to skip (one per line)")
 	rate := flag.Int("rate", 0, "Max queries per second (0 for unlimited)")
+	statsInterval := flag.Duration("stats-interval", 10*time.Minute, "How often to log a stats line to stderr with -j (0 to turn off; the TUI shows the same live)")
 	flag.Parse()
 
 	shardNum, totalShards, err := parseShardArg(*shard)
@@ -1195,16 +1256,20 @@ func main() {
 		}
 		cfg.output.flush()
 		cfg.stdout.flush()
-		os.Exit(1)
+		os.Exit(0)
 	}()
+
+	// stderr would draw over the TUI, so the stats line is only for -j runs
+	if *statsInterval > 0 && *jsonOutput {
+		go logStats(cfg, stats, shardStart, *statsInterval)
+	}
 
 	jobs := make(chan job, cfg.concurrency)
 	go feed(jobs, cfg, stats, shardStart, shardEnd)
 
 	if *jsonOutput {
 		eng, err := newEngine(cfg, *rate, func(j job, server string, resp DNSResponse, err error) {
-			handleResult(cfg, stats, nil, ipToString(j.ip), server, resp, err)
-			stats.track.done(j.round, uint64(bits.ReverseBytes32(j.ip)))
+			finishResult(cfg, stats, nil, j, server, resp, err)
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error opening sockets: %v\n", err)
@@ -1256,14 +1321,14 @@ func main() {
 					}
 
 					// First line: stats
-					statsLine := fmt.Sprintf(" [aqua]Elapsed:[:-] [white]%s [gray]│[-] [aqua]Round:[:-] [white]%d [gray]│[-] [aqua]Count:[:-] [white]%s [gray]│[-] [aqua]Progress:[:-] [darkgray]%.2f%%[-] [gray]│[-] [aqua]Rate:[:-] %s [gray]│[-] [aqua]CNAMEs:[:-] [yellow]%s[-][darkgray] (%.1f%%)[-] [gray]│[-] [aqua]Successful:[:-] [green]✓ %s[-][darkgray] (%.1f%%)[-] [gray]│[-] [aqua]Failed:[:-] [red]✗ %s[-][darkgray] (%.1f%%)[-] [gray]│[-] [aqua]Resolvers:[:-] [white]%d/%d[-]\n",
+					statsLine := fmt.Sprintf(" [aqua]Elapsed:[:-] [white]%s [gray]│[-] [aqua]Round:[:-] [white]%d [gray]│[-] [aqua]Count:[:-] [white]%s [gray]│[-] [aqua]Progress:[:-] [darkgray]%.2f%%[-] [gray]│[-] [aqua]Rate:[:-] %s [gray]│[-] [aqua]CNAME only:[:-] [yellow]%s[-] [gray]│[-] [aqua]Via CNAME:[:-] [yellow]%s[-] [gray]│[-] [aqua]Successful:[:-] [green]✓ %s[-][darkgray] (%.1f%%)[-] [gray]│[-] [aqua]Failed:[:-] [red]✗ %s[-][darkgray] (%.1f%%)[-] [gray]│[-] [aqua]Resolvers:[:-] [white]%d/%d[-]\n",
 						formatDuration(time.Since(stats.startTime)),
 						atomic.LoadUint64(&stats.round)+1,
 						formatNumber(processed),
 						percent,
 						colorizeSpeed(avgSpeed),
-						formatNumber(atomic.LoadUint64(&stats.cnames)),
-						float64(atomic.LoadUint64(&stats.cnames))/float64(processed)*100,
+						formatNumber(atomic.LoadUint64(&stats.cnameOnly)),
+						formatNumber(atomic.LoadUint64(&stats.viaCNAME)),
 						formatNumber(success),
 						float64(success)/float64(processed)*100,
 						formatNumber(failed),
@@ -1299,8 +1364,7 @@ func main() {
 	}()
 
 	eng, err := newEngine(cfg, *rate, func(j job, server string, resp DNSResponse, err error) {
-		handleResult(cfg, stats, textView, ipToString(j.ip), server, resp, err)
-		stats.track.done(j.round, uint64(bits.ReverseBytes32(j.ip)))
+		finishResult(cfg, stats, textView, j, server, resp, err)
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error opening sockets: %v\n", err)
@@ -1331,16 +1395,16 @@ func formatNumber(n uint64) string {
 
 func colorizeSpeed(speed float64) string {
 	switch {
-	case speed >= 500:
-		return fmt.Sprintf("[green]%5.0f/s[-]", speed)
-	case speed >= 350:
-		return fmt.Sprintf("[yellow]%5.0f/s[-]", speed)
-	case speed >= 200:
-		return fmt.Sprintf("[orange]%5.0f/s[-]", speed)
-	case speed >= 100:
-		return fmt.Sprintf("[red]%5.0f/s[-]", speed)
+	case speed >= 9000:
+		return fmt.Sprintf("[green]%6.0f/s[-]", speed)
+	case speed >= 6000:
+		return fmt.Sprintf("[yellow]%6.0f/s[-]", speed)
+	case speed >= 3000:
+		return fmt.Sprintf("[orange]%6.0f/s[-]", speed)
+	case speed >= 1000:
+		return fmt.Sprintf("[red]%6.0f/s[-]", speed)
 	default:
-		return fmt.Sprintf("[gray]%5.0f/s[-]", speed)
+		return fmt.Sprintf("[gray]%6.0f/s[-]", speed)
 	}
 }
 
@@ -1362,15 +1426,15 @@ func cleanNames(names []string) []string {
 // formatRecord returns one NDJSON line (without newline) for a result
 func formatRecord(timestamp time.Time, ip, server string, records []string, recordType, target string, ttl uint32) string {
 	record := struct {
-		Seen       string   `json:"seen"`
+		Timestamp  string   `json:"@timestamp"`
 		IP         string   `json:"ip"`
 		Nameserver string   `json:"nameserver"`
-		Record     []string `json:"record"`
+		Record     []string `json:"record,omitempty"`
 		RecordType string   `json:"record_type"`
 		CNAME      string   `json:"cname,omitempty"`
 		TTL        uint32   `json:"ttl"`
 	}{
-		Seen:       timestamp.Format(time.RFC3339),
+		Timestamp:  timestamp.Format(time.RFC3339),
 		IP:         ip,
 		Nameserver: server,
 		Record:     records,
@@ -1378,8 +1442,8 @@ func formatRecord(timestamp time.Time, ip, server string, records []string, reco
 		TTL:        ttl,
 	}
 
-	// RFC 2317 PTR reached through a CNAME
-	if recordType == "PTR" {
+	// the CNAME target: the RFC 2317 delegation for a PTR, or the whole answer for record_type CNAME
+	if recordType != "ERR" {
 		record.CNAME = target
 	}
 
@@ -1414,6 +1478,51 @@ func (l *lineWriter) flush() {
 	l.mu.Lock()
 	l.w.Flush()
 	l.mu.Unlock()
+}
+
+// logStats writes one progress line to stderr every interval: position, rates over the interval, timeouts,
+// the outcome of every finished IP and resolvers in rotation, so a long headless run leaves a history
+func logStats(cfg *Config, stats *Stats, start uint64, interval time.Duration) {
+	var lastProcessed, lastPTR, lastQueries, lastRetried uint64
+	var lastOutcomes [numOutcomes]uint64
+	began := time.Now()
+
+	for range time.Tick(interval) {
+		processed := atomic.LoadUint64(&stats.processed)
+		ptr := atomic.LoadUint64(&stats.success)
+		queries := atomic.LoadUint64(&cfg.queries)
+		retried := atomic.LoadUint64(&cfg.retried)
+		active, total := cfg.activeResolvers()
+
+		done := processed - lastProcessed
+		pct := func(n uint64) float64 {
+			if done == 0 {
+				return 0
+			}
+			return 100 * float64(n) / float64(done)
+		}
+
+		line := fmt.Sprintf("stats round=%d progress=%.3f%% next=%d elapsed=%s ips/s=%.0f ptr/s=%.0f queries/s=%.0f retries/s=%.0f ptr=%.1f%%",
+			atomic.LoadUint64(&stats.round)+1,
+			100*float64(atomic.LoadUint64(&stats.next)-start)/float64(stats.total),
+			atomic.LoadUint64(&stats.next),
+			time.Since(began).Round(time.Second),
+			float64(done)/interval.Seconds(),
+			float64(ptr-lastPTR)/interval.Seconds(),
+			float64(queries-lastQueries)/interval.Seconds(),
+			float64(retried-lastRetried)/interval.Seconds(),
+			pct(ptr-lastPTR))
+		// what the other IPs in the interval ended with, as a share of all IPs finished
+		var outcomes [numOutcomes]uint64
+		for i := range outcomes {
+			outcomes[i] = atomic.LoadUint64(&stats.outcomes[i])
+			line += fmt.Sprintf(" %s=%.1f%%", outcomeNames[i], pct(outcomes[i]-lastOutcomes[i]))
+		}
+		line += fmt.Sprintf(" lookups=%d queries=%d resolvers=%d/%d", processed, queries, active, total)
+		fmt.Fprintln(os.Stderr, line)
+
+		lastProcessed, lastPTR, lastQueries, lastRetried, lastOutcomes = processed, ptr, queries, retried, outcomes
+	}
 }
 
 func formatDuration(d time.Duration) string {
