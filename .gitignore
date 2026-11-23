@@ -20,3 +20,5 @@ ptrstream.exe
 # OS specific
 .DS_Store
 Thumbs.db 
+# Shipped exclude list (ignored by *.txt above)
+!reserved.txt

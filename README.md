@@ -13,7 +13,7 @@ PTRStream is a fast and efficient PTR record scanner designed for distributed sc
 - Real-time NDJSON output for streaming to data pipelines
 - Support for both PTR and CNAME records
 - Automatic DNS server rotation from public resolvers
-- Failing resolvers are benched for 10 minutes after 5 failures in a row
+- Failing resolvers are benched for 10 minutes after 20 failures in a row
 - Resume from a state file, loop forever for 24/7 runs
 - Exclude CIDRs from a file
 - Progress tracking with detailed statistics
@@ -41,6 +41,7 @@ go install github.com/acidvegas/ptrstream@latest
 | `-shard`   | `string`   |         | Shard specification *(index/total format)*                      |
 | `-state`   | `string`   |         | State file to resume from and save progress to                  |
 | `-t`       | `duration` | `2s`    | Timeout for DNS queries                                         |
+| `-stats-interval` | `duration` | `10m` | How often to log a stats line to stderr with `-j` *(0 to turn off)* |
 
 ## Usage
 
@@ -91,7 +92,7 @@ ptrstream -shard 4/4  # Machine 4
 Use `-l` to start over when the shard is finished and `-state` to survive restarts:
 
 ```bash
-ptrstream -j -l -shard 1/4 -state shard1.state -exclude exclude.txt
+ptrstream -j -l -shard 1/4 -state shard1.state -exclude reserved.txt
 ```
 
 The state file is one line, written every 10 seconds and on SIGINT/SIGTERM:
@@ -100,42 +101,44 @@ The state file is one line, written every 10 seconds and on SIGINT/SIGTERM:
 shard=1/4 round=3 next=1834567890
 ```
 
-`next` is the lowest position that still has an unfinished lookup *(tracked in blocks of 4,096 IPs)*, and output is flushed before the file is written, so a restart never skips an IP. Lookups that finished after that position are queried again, usually a few seconds of work. A state file for a different shard is refused.
+`next` is the lowest position that still has an unfinished lookup *(tracked in blocks of 4,096 IPs)*, and output is flushed before the file is written, so a restart never skips an IP. Lookups that finished after that position are queried again, usually a few seconds of work. A state file for a different shard is refused. Starting on a state file whose round is finished begins the next round from the start of the shard, with or without `-l`.
 
-## Real-time Data Pipeline Integration
+## Excluding ranges
 
-PTRStream outputs NDJSON *(Newline Delimited JSON)* format, making it perfect for real-time data pipeline integration. Each line contains a complete JSON record with:
+Nothing is skipped unless a file is passed with `-exclude`. [`reserved.txt`](./reserved.txt) lists the IPv4 ranges that are not on the public internet *(RFC 6890 special purpose, multicast and the old class E space)*. Resolvers answer those from their own local zones, mostly with `localhost`, so they are not real data. Round 1 of the full IPv4 space got about 64,000 of these answers.
+
+## Stats line
+
+With `-j`, every `-stats-interval` a line goes to stderr with the rates over that interval and what every finished IP ended with, as a share of all IPs finished in it *(the shares add up to 100%, the numbers below are only an example)*:
+
+```
+stats round=1 progress=1.006% next=43216647 elapsed=10m0s ips/s=7950 ptr/s=2350 queries/s=12000 retries/s=4050 ptr=29.6% nxdomain=38.2% servfail=6.1% refused=1.9% noptr=19.7% timeout=4.5% other=0.0% lookups=4769985 queries=7200000 resolvers=5857/12123
+```
+
+`-rate` caps `queries/s`, retries included, so `ips/s` is lower when many lookups need retries. The TUI shows the same numbers live, so the line is off without `-j`.
+
+## Output
+
+Results are NDJSON *(one JSON record per line)* on stdout with `-j` and in a file with `-o`, ready for any data pipeline. Each record has:
 
 | Field         | Description                                                     |
 |---------------|-----------------------------------------------------------------|
-| `seen`        | Timestamp *(RFC 3339)*                                          |
+| `@timestamp`  | Timestamp *(RFC 3339)*                                          |
 | `ip`          | IP address                                                      |
 | `nameserver`  | Resolver that answered                                          |
-| `record`      | Array of PTR names, the CNAME target, or the `FAIL.` error name |
+| `record`      | Array of PTR names, or the `FAIL.` error name *(left out for a CNAME with no PTR behind it)* |
 | `record_type` | `PTR`, `CNAME` or `ERR`                                         |
-| `cname`       | CNAME the PTR was reached through *(RFC 2317, only when present)* |
+| `cname`       | CNAME target in the answer *(the RFC 2317 delegation a PTR was reached through, or the whole answer for `record_type` CNAME)* |
 | `ttl`         | TTL of the answer                                               |
-
-Example using named pipe to Elasticsearch:
-```bash
-# Create a named pipe
-mkfifo /tmp/ptrstream
-
-# Start Elasticsearch ingestion in background
-cat /tmp/ptrstream | elasticsearch-bulk-import &
-
-# Run PTRStream with pipe output
-ptrstream -o /tmp/ptrstream
-```
 
 ## CNAME Support
 
-Classless reverse delegation *(RFC 2317)* answers with a CNAME followed by the PTR it points to. PTRStream records that as a `PTR` with the CNAME in `cname`. A CNAME with no PTR behind it is recorded as `CNAME` with the target in `record`.
+Classless reverse delegation *(RFC 2317)* answers with a CNAME followed by the PTR it points to. PTRStream records that as a `PTR` with the CNAME target in `cname`. A CNAME with no PTR behind it is recorded as `CNAME` with no `record` and the target in `cname`, so `cname` always means the CNAME target.
 
 ```json
-{"seen":"2026-11-16T02:17:37-05:00","ip":"195.53.95.8","nameserver":"1.1.1.1","record":["8.red-195-53-95.customer.static.ccgg.telefonica.net"],"record_type":"PTR","cname":"8.0.95.53.195.in-addr.arpa","ttl":86400}
-{"seen":"2026-11-16T02:17:37-05:00","ip":"151.41.96.70","nameserver":"8.8.8.8","record":["41.151.in-addr.arpa"],"record_type":"CNAME","ttl":3600}
-{"seen":"2026-11-16T02:17:37-05:00","ip":"70.48.177.180","nameserver":"1.1.1.1","record":["bras-base-wtbyon9417w-grc-11-70-48-177-180.dsl.bell.ca","bras-base-toroon01zb4-grc-37-70-48-177-180.dsl.bell.ca"],"record_type":"PTR","ttl":86400}
+{"@timestamp":"2026-11-16T02:17:37-05:00","ip":"195.53.95.8","nameserver":"1.1.1.1","record":["8.red-195-53-95.customer.static.ccgg.telefonica.net"],"record_type":"PTR","cname":"8.0.95.53.195.in-addr.arpa","ttl":86400}
+{"@timestamp":"2026-11-16T02:17:37-05:00","ip":"151.41.96.70","nameserver":"8.8.8.8","record_type":"CNAME","cname":"41.151.in-addr.arpa","ttl":3600}
+{"@timestamp":"2026-11-16T02:17:37-05:00","ip":"70.48.177.180","nameserver":"1.1.1.1","record":["bras-base-wtbyon9417w-grc-11-70-48-177-180.dsl.bell.ca","bras-base-toroon01zb4-grc-37-70-48-177-180.dsl.bell.ca"],"record_type":"PTR","ttl":86400}
 ```
 
 ## Debug Mode
@@ -159,7 +162,7 @@ Error types include:
 
 These errors are also included in the NDJSON output when using `-debug` with either `-o` or `-j`:
 ```json
-{"seen":"2024-01-05T12:34:56Z","ip":"1.2.3.4","nameserver":"8.8.8.8","record":["FAIL.TIMEOUT.in-addr.arpa"],"record_type":"ERR","ttl":0}
+{"@timestamp":"2024-01-05T12:34:56Z","ip":"1.2.3.4","nameserver":"8.8.8.8","record":["FAIL.TIMEOUT.in-addr.arpa"],"record_type":"ERR","ttl":0}
 ```
 
 ___

@@ -1,0 +1,22 @@
+# PTRStream - IPv4 ranges that are not on the public internet, for -exclude
+# reserved.txt
+#
+# From the IANA IPv4 Special-Purpose Address Registry (RFC 6890) plus multicast and the old class E space.
+# Resolvers answer these from their own local zones (mostly "localhost"), so the results are not real data.
+# Nothing is skipped unless this file is passed: ptrstream -exclude reserved.txt
+
+0.0.0.0/8          # "this network"
+10.0.0.0/8         # private (RFC 1918)
+100.64.0.0/10      # carrier-grade NAT (RFC 6598)
+127.0.0.0/8        # loopback
+169.254.0.0/16     # link local
+172.16.0.0/12      # private (RFC 1918)
+192.0.0.0/24       # IETF protocol assignments
+192.0.2.0/24       # documentation (TEST-NET-1)
+192.88.99.0/24     # deprecated 6to4 relay anycast (RFC 7526)
+192.168.0.0/16     # private (RFC 1918)
+198.18.0.0/15      # benchmarking (RFC 2544)
+198.51.100.0/24    # documentation (TEST-NET-2)
+203.0.113.0/24     # documentation (TEST-NET-3)
+224.0.0.0/4        # multicast
+240.0.0.0/4        # reserved, includes 255.255.255.255
