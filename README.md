@@ -6,15 +6,8 @@
 
 [![Release](https://img.shields.io/github/v/release/acidvegas/ptrstream?style=flat-square&color=success)](https://github.com/acidvegas/ptrstream/releases/latest)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/acidvegas/ptrstream?style=flat-square&logo=go&logoColor=white)](./go.mod)
-[![Go Report Card](https://goreportcard.com/badge/github.com/acidvegas/ptrstream?style=flat-square)](https://goreportcard.com/report/github.com/acidvegas/ptrstream)
 [![License](https://img.shields.io/github/license/acidvegas/ptrstream?style=flat-square&color=blue)](./LICENSE)
-[![Last Commit](https://img.shields.io/github/last-commit/acidvegas/ptrstream?style=flat-square)](https://github.com/acidvegas/ptrstream/commits)
 [![Stars](https://img.shields.io/github/stars/acidvegas/ptrstream?style=flat-square&color=yellow)](https://github.com/acidvegas/ptrstream/stargazers)
-<br>
-![IPv4 coverage](https://img.shields.io/badge/IPv4_coverage-100%25-00d7ff?style=flat-square)
-![Output](https://img.shields.io/badge/output-NDJSON-8a2be2?style=flat-square)
-![Sharding](https://img.shields.io/badge/sharding-n%2Ftotal-success?style=flat-square)
-![Resume](https://img.shields.io/badge/resume-exact-success?style=flat-square)
 
 ![](./.screens/preview.gif)
 
