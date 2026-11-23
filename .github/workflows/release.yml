@@ -1,0 +1,41 @@
+# PTRStream - Developed by acidvegas in Go (https://github.com/acidvegas/ptrstream)
+# .github/workflows/release.yml
+
+# Pushing a tag like v1.0.0 builds static binaries for each platform and attaches them to a GitHub release
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: |
+          mkdir dist
+          for target in linux/amd64 linux/arm64 linux/arm darwin/amd64 darwin/arm64 freebsd/amd64; do
+            os=${target%/*}
+            arch=${target#*/}
+            name="ptrstream-${GITHUB_REF_NAME}-${os}-${arch}"
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags "-s -w" -o "$name/ptrstream" .
+            cp LICENSE README.md reserved.txt "$name/"
+            tar -czf "dist/$name.tar.gz" "$name"
+          done
+          cd dist && sha256sum *.tar.gz > SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
